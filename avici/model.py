@@ -85,33 +85,28 @@ class BaseModel(nn.Module):
             z = torch.swapaxes(z, -3, -2)
 
         z = self.layer_norms[layer_norm_idx](z)
-        # till here
-   
+        # Make sure z and x have the same shape along the last two dimensions
         assert z.shape[-2] == x.shape[-2] and z.shape[-3] == x.shape[-3], "Do we have an odd number of layers?"
 
         # [..., n_vars, dim]
-        z = jnp.max(z, axis=-3)
+        z = torch.max(z, dim=-3)
 
         # u, v dibs embeddings for edge probabilities
-        u = hk.Sequential([
-            layer_norm(axis=self.ln_axis),
-            hk.Linear(self.out_dim, w_init=self.w_init),
-        ])(z)
-        v = hk.Sequential([
-            layer_norm(axis=self.ln_axis),
-            hk.Linear(self.out_dim, w_init=self.w_init),
-        ])(z)
+        u = nn.Sequential(
+            nn.LayerNorm(self.ln_axis),
+            nn.Linear(self.out_dim, bias=True))(z)
+        v = nn.Sequential(
+            nn.LayerNorm(self.ln_axis),
+            nn.Linear(self.out_dim, bias=True))(z)
 
         # edge logits
         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
-        u /= jnp.linalg.norm(u, axis=-1, ord=2, keepdims=True)
-        v /= jnp.linalg.norm(v, axis=-1, ord=2, keepdims=True)
-        logit_ij = jnp.einsum("...id,...jd->...ij", u, v)
-        temp = hk.get_parameter("learned_temp", (1, 1, 1), logit_ij.dtype,
-                                init=hk.initializers.Constant(self.cosine_temp_init)).squeeze()
-        logit_ij *= jnp.exp(temp)
-        logit_ij_bias = hk.get_parameter("final_matrix_bias", (1, 1, 1), logit_ij.dtype,
-                                         init=hk.initializers.Constant(self.logit_bias_init)).squeeze()
+        u /= torch.linalg.norm(u, dim=-1, ord=2, keepdim=True)
+        v /= torch.linalg.norm(v, dim=-1, ord=2, keepdim=True)
+        logit_ij = torch.einsum("...id,...jd->...ij", u, v)
+        temp = nn.Parameter(torch.tensor(self.cosine_temp_init).unsqueeze(0).unsqueeze(0).unsqueeze(0))
+        logit_ij *= torch.exp(temp)
+        logit_ij_bias = nn.Parameter(torch.tensor(self.logit_bias_init).unsqueeze(0).unsqueeze(0).unsqueeze(0))
         logit_ij += logit_ij_bias
 
         assert logit_ij.shape[-1] == x.shape[-2] and logit_ij.shape[-2] == x.shape[-2]
