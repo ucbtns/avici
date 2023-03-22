@@ -1,26 +1,23 @@
-import inspect
-import jax
-import jax.numpy as jnp
-import jax.random as random
-from jax.scipy.special import logsumexp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torch.optim import Adam
 
-import haiku as hk
-import functools
-
-from avici.utils.data_jax import jax_get_train_x, jax_get_x
+import numpy as np
 
 
-def layer_norm(*, axis, name=None):
-    return hk.LayerNorm(axis=axis, create_scale=True, create_offset=True, name=name)
+class LayerNorm(nn.Module):
+    def __init__(self, axis, eps=1e-5):
+        super().__init__()
+        self.axis = axis
+        self.eps = eps
+
+    def forward(self, x):
+        return F.layer_norm(x, x.shape[self.axis:], eps=self.eps)
 
 
-def set_diagonal(arr, val):
-    n_vars = arr.shape[-1]
-    return arr.at[..., jnp.arange(n_vars), jnp.arange(n_vars)].set(val)
-
-
-class BaseModel(hk.Module):
-
+class BaseModel(nn.Module):
     def __init__(self,
                  layers=8,
                  dim=128,
@@ -34,7 +31,7 @@ class BaseModel(hk.Module):
                  ln_axis=-1,
                  name="BaseModel",
                  ):
-        super().__init__(name=name)
+        super().__init__()
         self.dim = dim
         self.out_dim = out_dim or dim
         self.layers = 2 * layers
@@ -45,39 +42,51 @@ class BaseModel(hk.Module):
         self.key_size = key_size
         self.logit_bias_init = logit_bias_init
         self.cosine_temp_init = cosine_temp_init
-        self.w_init = hk.initializers.VarianceScaling(2.0, "fan_in", "uniform")  # kaiming uniform
 
+        self.linear = nn.Linear(self.dim, self.dim)
+        self.layer_norms = nn.ModuleList([LayerNorm(axis=ln_axis) for _ in range(self.layers * 2 + 2)])
+        self.attentions = nn.ModuleList([nn.MultiheadAttention(embed_dim=self.dim,
+                                                               num_heads=self.num_heads,
+                                                               kdim=self.key_size,
+                                                               vdim=self.dim) for _ in range(self.layers)])
+        self.linears1 = nn.ModuleList([nn.Linear(self.dim, self.widening_factor * self.dim) for _ in range(self.layers)])
+        self.linears2 = nn.ModuleList([nn.Linear(self.widening_factor * self.dim, self.dim) for _ in range(self.layers)])
+        self.linear_u = nn.Linear(self.dim, self.out_dim)
+        self.linear_v = nn.Linear(self.dim, self.out_dim)
 
-    def __call__(self, x, is_training: bool):
+        self.learned_temp = nn.Parameter(torch.tensor(cosine_temp_init))
+        self.final_matrix_bias = nn.Parameter(torch.tensor(logit_bias_init))
+
+    def forward(self, x, is_training: bool):
         dropout_rate = self.dropout if is_training else 0.0
-        z = hk.Linear(self.dim)(x)
+        z = self.linear(x)
 
-        for _ in range(self.layers):
+        layer_norm_idx = 0
+
+        for i in range(self.layers):
             # mha
-            q_in = layer_norm(axis=self.ln_axis)(z)
-            k_in = layer_norm(axis=self.ln_axis)(z)
-            v_in = layer_norm(axis=self.ln_axis)(z)
-            z_attn = hk.MultiHeadAttention(
-                num_heads=self.num_heads,
-                key_size=self.key_size,
-                w_init_scale=2.0,
-                model_size=self.dim,
-            )(q_in, k_in, v_in)
-            z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_attn)
+            q_in = self.layer_norms[layer_norm_idx](z)
+            k_in = self.layer_norms[layer_norm_idx + 1](z)
+            v_in = self.layer_norms[layer_norm_idx + 2](z)
+            layer_norm_idx += 3
+
+            z_attn, _ = self.attentions[i](q_in, k_in, v_in)
+            z_attn = F.dropout(z_attn, dropout_rate)
+            z = z + z_attn
 
             # ffn
-            z_in = layer_norm(axis=self.ln_axis)(z)
-            z_ffn = hk.Sequential([
-                hk.Linear(self.widening_factor * self.dim, w_init=self.w_init),
-                jax.nn.relu,
-                hk.Linear(self.dim, w_init=self.w_init),
-            ])(z_in)
-            z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_ffn)
+            z_in = self.layer_norms[layer_norm_idx](z)
+            layer_norm_idx += 1
+            z_ffn = F.relu(self.linears1[i](z_in))
+            z_ffn = F.dropout(self.linears2[i](z_ffn), dropout_rate)
+            z = z + z_ffn
 
             # flip N and d axes
-            z = jnp.swapaxes(z, -3, -2)
+            z = torch.swapaxes(z, -3, -2)
 
-        z = layer_norm(axis=self.ln_axis)(z)
+        z = self.layer_norms[layer_norm_idx](z)
+        # till here
+   
         assert z.shape[-2] == x.shape[-2] and z.shape[-3] == x.shape[-3], "Do we have an odd number of layers?"
 
         # [..., n_vars, dim]
