@@ -125,7 +125,7 @@ class InferenceModel:
                  mask_diag=True,
                  ):
 
-        self._train_p_obs_only = jnp.array(train_p_obs_only)
+        self._train_p_obs_only = torch.tensor(train_p_obs_only)
         self._acyclicity_weight = acyclicity
         self._acyclicity_power_iters = acyclicity_pow_iters
         self.mask_diag = mask_diag
@@ -138,10 +138,8 @@ class InferenceModel:
             # print(f"Ignoring deprecated kwarg `{k}` loaded from `model_kwargs` in checkpoint")
 
         # init forward pass transform
-        self.net = hk.transform(lambda *args: model_class(**model_kwargs)(*args))
+        self.net = model_class(**model_kwargs)
 
-
-    @functools.partial(jax.jit, static_argnums=(0, 1))
     def sample_graphs(self, n_samples, params, rng, x):
         """
         Args:
@@ -150,26 +148,22 @@ class InferenceModel:
             rng
             x: [..., N, d, 2]
             is_count_data [...] bool
-
         Returns:
             graph samples of shape [..., n_samples, d, d]
         """
         # [..., d, d]
         is_training = False
-        logits = self.net.apply(params, rng, x, is_training)
-        prob1 = jax.nn.sigmoid(logits)
+        logits = self.net(x, is_training)
+        prob1 = torch.sigmoid(logits)
 
         # sample graphs
         # [..., n_samples, d, d]
-        key, subk = random.split(rng)
-        samples = jnp.moveaxis(random.bernoulli(subk, prob1, shape=(n_samples,) + prob1.shape), 0, -3).astype(jnp.int32)
+        samples = torch.bernoulli(prob1.unsqueeze(-3).expand(n_samples, *prob1.shape)).transpose(0, -3).type(torch.int32)
         if self.mask_diag:
             samples = set_diagonal(samples, 0.0)
 
         return samples
 
-
-    @functools.partial(jax.jit, static_argnums=(0, 4))
     def infer_edge_logprobs(self, params, rng, x, is_training: bool):
         """
         Args:
@@ -178,34 +172,30 @@ class InferenceModel:
             x: [..., N, d, 2]
             is_training
             is_count_data [...] bool
-
         Returns:
             logprobs of graph adjacency matrix prediction of shape [..., d, d]
         """
         # [..., d, d]
-        logits = self.net.apply(params, rng, x, is_training)
-        logp_edges = jax.nn.log_sigmoid(logits)
+        logits = self.net(x, is_training)
+        logp_edges = F.logsigmoid(logits)
         if self.mask_diag:
-            logp_edges = set_diagonal(logp_edges, -jnp.inf)
+            logp_edges = set_diagonal(logp_edges, -float('inf'))
 
         return logp_edges
-
 
     def infer_edge_probs(self, params, x):
         """
         For test time inference
-
         Args:
             params: hk.Params
             x: [..., N, d, 1]
             is_count_data [...] bool
-
         Returns:
             probabilities of graph adjacency matrix prediction of shape [..., d, d]
         """
-        is_training_, dummy_rng_ = False, random.PRNGKey(0) # assume test time
-        logp_edges = self.infer_edge_logprobs(params, dummy_rng_, x, is_training_)
-        p_edges = jnp.exp(logp_edges)
+        is_training_ = False  # assume test time
+        logp_edges = self.infer_edge_logprobs(params, 0, x, is_training_)
+        p_edges = torch.exp(logp_edges)
         return p_edges
 
 
