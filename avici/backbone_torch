@@ -1,0 +1,325 @@
+import os
+import json
+import pickle
+import warnings
+import functools
+import torch
+from torch import nn
+from torch.autograd import grad
+from torch.optim import Adam
+from torch.utils.data import DataLoader
+from torch.nn.utils import clip_grad_norm_ as global_norm
+from deepdiff import DeepDiff
+from typing import Any, NamedTuple
+from pathlib import Path
+
+import warnings
+warnings.formatwarning = lambda msg, category, path, lineno, file: f"{path}:{lineno}: {category.__name__}: {msg}\n"
+
+from avici.definitions import CHECKPOINT_KWARGS
+
+def get_first(super_tree):
+    """Gets values from the first device."""
+    return {k: v[0] for k, v in super_tree.items()}
+
+def make_serializable(d):
+    if isinstance(d, dict):
+        return {k: make_serializable(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [make_serializable(v) for v in d]
+    elif callable(d):
+        if hasattr(d, "__name__"):
+            return d.__name__
+        else:
+            return type(d).__name__
+    elif isinstance(d, Path):
+        return str(d)
+    elif isinstance(d, torch.Tensor):
+        return d.tolist()
+    else:
+        return d
+
+def fix_json_loading(d):
+    if isinstance(d, dict):
+        return {((int(k) if k.isdigit() else k) if isinstance(k, str) else k):
+                    fix_json_loading(v) for k, v in d.items()}
+    elif isinstance(d, list):
+        return [fix_json_loading(v) for v in d]
+    elif isinstance(d, Path):
+        return str(d)
+    else:
+        return d
+
+class ModelState(NamedTuple):
+    step: int
+    rng: Any
+    opt_state: Any
+    params: Any
+    dual: Any
+    dual_penalty_polyak: Any
+    ave_params: Any  # polyak average
+
+class Updater:
+    """
+    A stateless abstraction around an init_fn/update_fn pair.
+    Creates a `ModelState` object and updates it.
+    """
+
+    def __init__(self, *, net_init, loss_fn, opt,
+                 acyclicity_dual_lr,
+                 acyclicity_inner_step,
+                 acyclicity_burnin,
+                 acyclicity_warmup,
+                 polyak_rate=1e-4):
+
+        self._net_init = net_init
+        self._loss_fn = loss_fn
+        self._opt = opt
+        self.distributed = False
+        self.acyclicity_dual_lr = acyclicity_dual_lr
+        self.acyclicity_inner_step = acyclicity_inner_step
+        self.acyclicity_burnin = acyclicity_burnin
+        self.acyclicity_warmup = acyclicity_warmup
+        self.polyak_rate = polyak_rate
+
+    def init(self, rng, x):
+        """Initializes model state of the updater."""
+        out_rng, init_rng = torch.split(rng)
+        params = self._net_init(init_rng, x, True) # is_training = True
+        opt_state = self._opt.init(params)
+        return ModelState(
+            step=0,
+            rng=out_rng,
+            opt_state=opt_state,
+            params=params,
+            dual=torch.tensor(0.0),
+            dual_penalty_polyak=torch.tensor(0.0),
+            ave_params=params,
+        )
+
+    def update(self, state, batch, t):
+        """Updates the ModelState `state` using data `batch` and returns metrics."""
+
+        new_rng, step_rng = torch.split(state.rng)
+
+        # compute loss and gradient
+        state.params.requires_grad_(True)
+        loss, aux = self._loss_fn(state.params, state.dual, step_rng, batch, t, True)  # is_training = True
+        loss_grads = grad(loss, state.params, create_graph=True)
+
+        # optimizer step on params
+        opt_update, opt_state = self._opt.update(loss_grads, state.opt_state, state.params) # some optimizers need params
+        params = state.params - opt_update
+
+        # track polyak average of params
+        ave_params = state.ave_params + self.polyak_rate * (params - state.ave_params)
+
+        # dual step
+        dual_penalty = torch.maximum(aux["acyc"], torch.tensor(0.0))
+        dual_penalty_ave = torch.where(
+            t == 0,
+            dual_penalty,
+            state.dual_penalty_polyak + self.polyak_rate * (dual_penalty - state.dual_penalty_polyak))
+
+        if self.acyclicity_warmup:
+            dual_lr = min(self.acyclicity_dual_lr, t * self.acyclicity_dual_lr / self.acyclicity_burnin)
+            effective_burnin = 0
+        else:
+            dual_lr = self.acyclicity_dual_lr
+            effective_burnin = self.acyclicity_burnin
+
+        dual = torch.where(
+            (t % self.acyclicity_inner_step == 0) & (t > effective_burnin),
+            state.dual + dual_lr * dual_penalty_ave,
+            state.dual)
+
+        # state
+        new_state = ModelState(
+            step=state.step + 1,
+            rng=new_rng,
+            opt_state=opt_state,
+            params=params,
+            dual=dual,
+            dual_penalty_polyak=dual_penalty_ave,
+            ave_params=ave_params,
+        )
+        # log scalars
+        metrics = {
+            "loss": loss,
+            "dual": dual,
+            "grad_norm": loss_grads.norm(),
+            **aux,
+        }
+        return new_state, metrics
+
+
+class SuperUpdater:
+    """
+    `Updater` with distributed training (torch.distributed) functionality.
+    """
+
+    def __init__(self, *, net_init, loss_fn, opt,
+                 acyclicity_dual_lr,
+                 acyclicity_inner_step,
+                 acyclicity_burnin,
+                 acyclicity_warmup,
+                 local_device_count,
+                 polyak_rate=1e-4):
+        self._net_init = net_init
+        self._loss_fn = loss_fn
+        self._opt = opt
+        self.distributed = True
+        self.local_device_count = local_device_count
+        self.acyclicity_dual_lr = acyclicity_dual_lr
+        self.acyclicity_inner_step = acyclicity_inner_step
+        self.acyclicity_burnin = acyclicity_burnin
+        self.acyclicity_warmup = acyclicity_warmup
+        self.polyak_rate = polyak_rate
+
+    def init(self, rng, x):
+        """Initializes model state of the updater."""
+        out_rng, init_rng = torch.split(rng)
+        params = self._net_init(init_rng, x, True)  # is_training = True
+        opt_state = self._opt.init(params)
+        return ModelState(
+            step=0,
+            rng=out_rng,
+            opt_state=opt_state,
+            params=params,
+            dual=torch.tensor(0.0),
+            dual_penalty_polyak=torch.tensor(0.0),
+            ave_params=params,
+        )
+
+    def update(self, state, batch, t):
+        """Updates the ModelState `state` using data `batch` and returns metrics."""
+
+        new_rng, step_rng = torch.split(state.rng)
+
+        # compute loss and gradient
+        state.params.requires_grad_(True)
+        loss, aux = self._loss_fn(state.params, state.dual, step_rng, batch, t, True)  # is_training = True
+        loss_grads = grad(loss, state.params, create_graph=True)
+
+        # take the mean of the gradients across all data-parallel replicas
+        for grad_tensor in loss_grads:
+            dist.all_reduce(grad_tensor, op=dist.ReduceOp.SUM)
+            grad_tensor /= self.local_device_count
+
+        # optimizer step on params (will perform the same step on every device due to above line)
+        opt_update, opt_state = self._opt.update(loss_grads, state.opt_state, state.params)  # some optimizers need params
+        params = state.params - opt_update
+
+        # track polyak average of params
+        ave_params = state.ave_params + self.polyak_rate * (params - state.ave_params)
+
+        # dual step
+        dual_penalty = torch.maximum(torch.tensor(0.0), aux["acyc"])
+        dual_penalty = dual_penalty.mean()
+        dual_penalty_ave = torch.where(
+            t == 0,
+            dual_penalty,
+            state.dual_penalty_polyak + self.polyak_rate * (dual_penalty - state.dual_penalty_polyak))
+
+        if self.acyclicity_warmup:
+            dual_lr = min(self.acyclicity_dual_lr, t * self.acyclicity_dual_lr / self.acyclicity_burnin)
+            effective_burnin = 0
+        else:
+            dual_lr = self.acyclicity_dual_lr
+            effective_burnin = self.acyclicity_burnin
+
+        dual = torch.where((t % self.acyclicity_inner_step == 0) & (t > effective_burnin),
+                   state.dual + dual_lr * dual_penalty_ave,
+                   state.dual)
+
+        # state
+        new_state = ModelState(
+            step=state.step + 1,
+            rng=new_rng,
+            opt_state=opt_state,
+            params=params,
+            dual=dual,
+            dual_penalty_polyak=dual_penalty_ave,
+            ave_params=ave_params,
+        )
+
+        metrics = {
+            "loss": loss,
+            "dual": dual,
+            "grad_norm": global_norm(loss_grads, 1.0),
+            **aux,
+        }
+        metrics = {
+            k: torch.stack([v]) for k, v in metrics.items()}
+        metrics = {
+            k: torch.mean(v, dim=0) for k, v in metrics.items()}
+        
+        return new_state, metrics
+    
+
+class CheckpointingUpdater:
+    """A didactic checkpointing wrapper around an `Updater` or `SuperUpdater`."""
+
+    def __init__(self, inner, checkpoint_dir, checkpoint_every_n=10000, base_str="checkpoint_", save_kwargs=None):
+        self._inner = inner
+        self._checkpoint_dir = checkpoint_dir
+        self._checkpoint_every_n = checkpoint_every_n
+        self._base_str = base_str
+        self._save_kwargs = save_kwargs
+        self._just_loaded = False # avoids serialization immediately after loading
+
+    def _checkpoint_paths(self):
+        return sorted([p for p in os.listdir(self._checkpoint_dir) if self._base_str in p])
+
+    def checkpoint(self, state, step):
+        path = os.path.join(self._checkpoint_dir, f'{self._base_str}{step:07d}.pkl')
+        if self._inner.distributed:
+            # For distributed training, only save 1 copy of model state
+            state = torch.nest.map(lambda leaf: leaf[0], state)
+        checkpoint_state = torch.jit.script(state)
+        print(f'Serializing experiment state to {path}', flush=True)
+        with open(path, 'wb') as f:
+            # Replace `pickle.dump(checkpoint_state, f)` with the appropriate PyTorch serialization method
+            pass
+        return
+
+    def init(self, rng, data):
+        """Initialize experiment state. """
+        if not os.path.exists(self._checkpoint_dir) or not self._checkpoint_paths():
+            os.makedirs(self._checkpoint_dir, exist_ok=True)
+            print(f'Checkpoint directory at {self._checkpoint_dir}', flush=True)
+            if self._save_kwargs is not None:
+                with open(os.path.join(self._checkpoint_dir, CHECKPOINT_KWARGS), "w") as file:
+                    json.dump(make_serializable(self._save_kwargs), file, indent=4, sort_keys=True)
+            return self._inner.init(rng, data)
+        else:
+            last_checkpoint = os.path.join(self._checkpoint_dir, self._checkpoint_paths()[-1])
+            print(f'Loading latest checkpoint from {last_checkpoint}', flush=True)
+            if self._save_kwargs is not None:
+                with open(os.path.join(self._checkpoint_dir, CHECKPOINT_KWARGS), "r") as file:
+                    loaded_kwargs = json.load(file)
+                    loaded_kwargs = fix_json_loading(loaded_kwargs)
+                    if loaded_kwargs != make_serializable(self._save_kwargs):
+                        diff = DeepDiff(loaded_kwargs, make_serializable(self._save_kwargs)).pretty()
+                        warn_str = f"Specified save_kwargs and those found in checkpoint directory don't match: \n"
+                        warnings.warn(warn_str + diff)
+
+            with open(last_checkpoint, 'rb') as f:
+                state = pickle.load(f)
+                if self._inner.distributed:
+                    # For distributed training, replicate copy of model state on each device
+                    device_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                    state = torch.nest.map(lambda leaf: [leaf] * device_count, state)
+                self._just_loaded = True
+                return state
+
+    def update(self, state, data, step):
+            """Update experiment state. """
+            if (step % self._checkpoint_every_n) == 0 and step != 0:
+                if self._just_loaded:
+                    self._just_loaded = False
+                else:
+                    self.checkpoint(state, step)
+
+            state, out = self._inner.update(state, data, step)
+            return state, out

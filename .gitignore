@@ -17,6 +17,10 @@ slurm*
 *.zip
 *.json
 
+# local tests:
+tests.py
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

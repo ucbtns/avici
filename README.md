@@ -193,3 +193,34 @@ updated anymore and may contain outdated notation and documentation.
   year={2022}
 }
 ```
+
+
+<!-- Notes:
+
+/avici:
+    /utils:
+        data_jax -> data_torch.py
+        data / .
+        example / .
+        graph / . -- note its in igraph.
+        load / .
+        parse / .
+        plot / .
+        ty -> torch.py
+        version_control / .
+    /synthetic:
+        Asbtract / .
+        Distribution -- need to change. 
+        gene / don't think we need this
+        graph -- need to change (will check) 
+        linear / . (uses rng)
+        noise_scale / . (uses rng)
+        rff / . (uses rng)
+        utils / . (uses rng)
+    backbone.py -> backbone_torch.py (issues with norm, pickle and gpu call)
+    buffer /. (uses rng)
+    data.py -> data_torch.py (NOTE: _device_put_sharded isn;t going to work because of the mismatch)
+    definitions.py -> doesn't need to be changed. 
+    model.py -> model_torch.py 
+    
+-->

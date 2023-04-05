@@ -1,23 +1,26 @@
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.optim import Adam
+import inspect
+import jax
+import jax.numpy as jnp
+import jax.random as random
+from jax.scipy.special import logsumexp
 
-import numpy as np
+import haiku as hk
+import functools
 
-
-class LayerNorm(nn.Module):
-    def __init__(self, axis, eps=1e-5):
-        super().__init__()
-        self.axis = axis
-        self.eps = eps
-
-    def forward(self, x):
-        return F.layer_norm(x, x.shape[self.axis:], eps=self.eps)
+from avici.utils.data_jax import jax_get_train_x, jax_get_x
 
 
-class BaseModel(nn.Module):
+def layer_norm(*, axis, name=None):
+    return hk.LayerNorm(axis=axis, create_scale=True, create_offset=True, name=name)
+
+
+def set_diagonal(arr, val):
+    n_vars = arr.shape[-1]
+    return arr.at[..., jnp.arange(n_vars), jnp.arange(n_vars)].set(val)
+
+
+class BaseModel(hk.Module):
+
     def __init__(self,
                  layers=8,
                  dim=128,
@@ -31,7 +34,7 @@ class BaseModel(nn.Module):
                  ln_axis=-1,
                  name="BaseModel",
                  ):
-        super().__init__()
+        super().__init__(name=name)
         self.dim = dim
         self.out_dim = out_dim or dim
         self.layers = 2 * layers
@@ -42,71 +45,64 @@ class BaseModel(nn.Module):
         self.key_size = key_size
         self.logit_bias_init = logit_bias_init
         self.cosine_temp_init = cosine_temp_init
+        self.w_init = hk.initializers.VarianceScaling(2.0, "fan_in", "uniform")  # kaiming uniform
 
-        self.linear = nn.Linear(self.dim, self.dim)
-        self.layer_norms = nn.ModuleList([LayerNorm(axis=ln_axis) for _ in range(self.layers * 2 + 2)])
-        self.attentions = nn.ModuleList([nn.MultiheadAttention(embed_dim=self.dim,
-                                                               num_heads=self.num_heads,
-                                                               kdim=self.key_size,
-                                                               vdim=self.dim) for _ in range(self.layers)])
-        self.linears1 = nn.ModuleList([nn.Linear(self.dim, self.widening_factor * self.dim) for _ in range(self.layers)])
-        self.linears2 = nn.ModuleList([nn.Linear(self.widening_factor * self.dim, self.dim) for _ in range(self.layers)])
-        self.linear_u = nn.Linear(self.dim, self.out_dim)
-        self.linear_v = nn.Linear(self.dim, self.out_dim)
 
-        self.learned_temp = nn.Parameter(torch.tensor(cosine_temp_init))
-        self.final_matrix_bias = nn.Parameter(torch.tensor(logit_bias_init))
-
-    def forward(self, x, is_training: bool):
+    def __call__(self, x, is_training: bool):
         dropout_rate = self.dropout if is_training else 0.0
-        z = self.linear(x)
+        z = hk.Linear(self.dim)(x)
 
-        layer_norm_idx = 0
-
-        for i in range(self.layers):
+        for _ in range(self.layers):
             # mha
-            q_in = self.layer_norms[layer_norm_idx](z)
-            k_in = self.layer_norms[layer_norm_idx + 1](z)
-            v_in = self.layer_norms[layer_norm_idx + 2](z)
-            layer_norm_idx += 3
-
-            z_attn, _ = self.attentions[i](q_in, k_in, v_in)
-            z_attn = F.dropout(z_attn, dropout_rate)
-            z = z + z_attn
+            q_in = layer_norm(axis=self.ln_axis)(z)
+            k_in = layer_norm(axis=self.ln_axis)(z)
+            v_in = layer_norm(axis=self.ln_axis)(z)
+            z_attn = hk.MultiHeadAttention(
+                num_heads=self.num_heads,
+                key_size=self.key_size,
+                w_init_scale=2.0,
+                model_size=self.dim,
+            )(q_in, k_in, v_in)
+            z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_attn)
 
             # ffn
-            z_in = self.layer_norms[layer_norm_idx](z)
-            layer_norm_idx += 1
-            z_ffn = F.relu(self.linears1[i](z_in))
-            z_ffn = F.dropout(self.linears2[i](z_ffn), dropout_rate)
-            z = z + z_ffn
+            z_in = layer_norm(axis=self.ln_axis)(z)
+            z_ffn = hk.Sequential([
+                hk.Linear(self.widening_factor * self.dim, w_init=self.w_init),
+                jax.nn.relu,
+                hk.Linear(self.dim, w_init=self.w_init),
+            ])(z_in)
+            z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_ffn)
 
             # flip N and d axes
-            z = torch.swapaxes(z, -3, -2)
+            z = jnp.swapaxes(z, -3, -2)
 
-        z = self.layer_norms[layer_norm_idx](z)
-        # Make sure z and x have the same shape along the last two dimensions
+        z = layer_norm(axis=self.ln_axis)(z)
         assert z.shape[-2] == x.shape[-2] and z.shape[-3] == x.shape[-3], "Do we have an odd number of layers?"
 
         # [..., n_vars, dim]
-        z = torch.max(z, dim=-3)
+        z = jnp.max(z, axis=-3)
 
         # u, v dibs embeddings for edge probabilities
-        u = nn.Sequential(
-            nn.LayerNorm(self.ln_axis),
-            nn.Linear(self.out_dim, bias=True))(z)
-        v = nn.Sequential(
-            nn.LayerNorm(self.ln_axis),
-            nn.Linear(self.out_dim, bias=True))(z)
+        u = hk.Sequential([
+            layer_norm(axis=self.ln_axis),
+            hk.Linear(self.out_dim, w_init=self.w_init),
+        ])(z)
+        v = hk.Sequential([
+            layer_norm(axis=self.ln_axis),
+            hk.Linear(self.out_dim, w_init=self.w_init),
+        ])(z)
 
         # edge logits
         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
-        u /= torch.linalg.norm(u, dim=-1, ord=2, keepdim=True)
-        v /= torch.linalg.norm(v, dim=-1, ord=2, keepdim=True)
-        logit_ij = torch.einsum("...id,...jd->...ij", u, v)
-        temp = nn.Parameter(torch.tensor(self.cosine_temp_init).unsqueeze(0).unsqueeze(0).unsqueeze(0))
-        logit_ij *= torch.exp(temp)
-        logit_ij_bias = nn.Parameter(torch.tensor(self.logit_bias_init).unsqueeze(0).unsqueeze(0).unsqueeze(0))
+        u /= jnp.linalg.norm(u, axis=-1, ord=2, keepdims=True)
+        v /= jnp.linalg.norm(v, axis=-1, ord=2, keepdims=True)
+        logit_ij = jnp.einsum("...id,...jd->...ij", u, v)
+        temp = hk.get_parameter("learned_temp", (1, 1, 1), logit_ij.dtype,
+                                init=hk.initializers.Constant(self.cosine_temp_init)).squeeze()
+        logit_ij *= jnp.exp(temp)
+        logit_ij_bias = hk.get_parameter("final_matrix_bias", (1, 1, 1), logit_ij.dtype,
+                                         init=hk.initializers.Constant(self.logit_bias_init)).squeeze()
         logit_ij += logit_ij_bias
 
         assert logit_ij.shape[-1] == x.shape[-2] and logit_ij.shape[-2] == x.shape[-2]
@@ -125,7 +121,7 @@ class InferenceModel:
                  mask_diag=True,
                  ):
 
-        self._train_p_obs_only = torch.tensor(train_p_obs_only)
+        self._train_p_obs_only = jnp.array(train_p_obs_only)
         self._acyclicity_weight = acyclicity
         self._acyclicity_power_iters = acyclicity_pow_iters
         self.mask_diag = mask_diag
@@ -138,8 +134,10 @@ class InferenceModel:
             # print(f"Ignoring deprecated kwarg `{k}` loaded from `model_kwargs` in checkpoint")
 
         # init forward pass transform
-        self.net = model_class(**model_kwargs)
+        self.net = hk.transform(lambda *args: model_class(**model_kwargs)(*args))
 
+
+    @functools.partial(jax.jit, static_argnums=(0, 1))
     def sample_graphs(self, n_samples, params, rng, x):
         """
         Args:
@@ -153,17 +151,20 @@ class InferenceModel:
         """
         # [..., d, d]
         is_training = False
-        logits = self.net(x, is_training)
-        prob1 = torch.sigmoid(logits)
+        logits = self.net.apply(params, rng, x, is_training)
+        prob1 = jax.nn.sigmoid(logits)
 
         # sample graphs
         # [..., n_samples, d, d]
-        samples = torch.bernoulli(prob1.unsqueeze(-3).expand(n_samples, *prob1.shape)).transpose(0, -3).type(torch.int32)
+        key, subk = random.split(rng)
+        samples = jnp.moveaxis(random.bernoulli(subk, prob1, shape=(n_samples,) + prob1.shape), 0, -3).astype(jnp.int32)
         if self.mask_diag:
             samples = set_diagonal(samples, 0.0)
 
         return samples
 
+
+    @functools.partial(jax.jit, static_argnums=(0, 4))
     def infer_edge_logprobs(self, params, rng, x, is_training: bool):
         """
         Args:
@@ -176,12 +177,13 @@ class InferenceModel:
             logprobs of graph adjacency matrix prediction of shape [..., d, d]
         """
         # [..., d, d]
-        logits = self.net(x, is_training)
-        logp_edges = F.logsigmoid(logits)
+        logits = self.net.apply(params, rng, x, is_training)
+        logp_edges = jax.nn.log_sigmoid(logits)
         if self.mask_diag:
-            logp_edges = set_diagonal(logp_edges, -float('inf'))
+            logp_edges = set_diagonal(logp_edges, -jnp.inf)
 
         return logp_edges
+
 
     def infer_edge_probs(self, params, x):
         """
@@ -193,9 +195,9 @@ class InferenceModel:
         Returns:
             probabilities of graph adjacency matrix prediction of shape [..., d, d]
         """
-        is_training_ = False  # assume test time
-        logp_edges = self.infer_edge_logprobs(params, 0, x, is_training_)
-        p_edges = torch.exp(logp_edges)
+        is_training_, dummy_rng_ = False, random.PRNGKey(0) # assume test time
+        logp_edges = self.infer_edge_logprobs(params, dummy_rng_, x, is_training_)
+        p_edges = jnp.exp(logp_edges)
         return p_edges
 
 
@@ -219,7 +221,6 @@ class InferenceModel:
         """
         No Bears acyclicity constraint by
         https://psb.stanford.edu/psb-online/proceedings/psb20/Lee.pdf
-
         Performed in log-space
         """
 
