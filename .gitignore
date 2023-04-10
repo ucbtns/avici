@@ -1,5 +1,6 @@
 tmp/
 cache/
+model_data/ 
 
 # git cannot parse exceptions if not adding the * to data/*
 .DS_Store

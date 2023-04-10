@@ -17,19 +17,8 @@ import numpy as np
 
 from avici.utils.data_torch import torch_get_train_x, torch_get_x 
 
-class LayerNorm(nn.Module):
-    def __init__(self, axis, name=None):
-        super().__init__()
-        self.axis = axis
-        self.name = name
-        self.scale = nn.Parameter(torch.ones(axis))
-        self.bias = nn.Parameter(torch.zeros(axis))
-
-    def forward(self, x):
-        x_mean = x.mean(dim=self.axis, keepdim=True)
-        x_var = ((x - x_mean) ** 2).mean(dim=self.axis, keepdim=True)
-        x_norm = (x - x_mean) / torch.sqrt(x_var + 1e-12)
-        return x_norm * self.scale + self.bias
+def layer_norm(shape):
+    return nn.LayerNorm(normalized_shape=shape, elementwise_affine=True)
 
 # def set_diagonal(arr, val):
 #     n_vars = arr.shape[-1]
@@ -47,8 +36,8 @@ def set_diagonal(tensor, value):
         diag_mask = torch.eye(tensor.size(-1), dtype=torch.bool, device=tensor.device).expand_as(tensor)
         return tensor.masked_fill_(diag_mask, value)
 
-
 class BaseModel(nn.Module):
+
     def __init__(self,
                  layers=8,
                  dim=128,
@@ -62,7 +51,8 @@ class BaseModel(nn.Module):
                  ln_axis=-1,
                  name="BaseModel",
                  ):
-        super().__init__()
+        
+        super(BaseModel, self).__init__()
         self.dim = dim
         self.out_dim = out_dim or dim
         self.layers = 2 * layers
@@ -73,74 +63,70 @@ class BaseModel(nn.Module):
         self.key_size = key_size
         self.logit_bias_init = logit_bias_init
         self.cosine_temp_init = cosine_temp_init
+        # self.w_init = hk.initializers.VarianceScaling(2.0, "fan_in", "uniform")  # kaiming uniform/
         self.w_init = functools.partial(init.kaiming_uniform_, a=2.0, mode='fan_in', nonlinearity='relu')
 
-        self.linear = nn.Linear(self.dim, self.dim)
-        self.layer_norms = nn.ModuleList([LayerNorm(axis=ln_axis) for _ in range(self.layers * 2 + 2)])
-        # TODO: whether this has the right initialisation - need to add this throughout:
-        self.attentions = nn.ModuleList([nn.MultiheadAttention(embed_dim=self.dim,
-                                                               num_heads=self.num_heads,
-                                                               kdim=self.key_size,
-                                                               vdim=self.dim) for _ in range(self.layers)])
-        self.linears1 = nn.ModuleList([nn.Linear(self.dim, self.widening_factor * self.dim) for _ in range(self.layers)])
-        self.linears2 = nn.ModuleList([nn.Linear(self.widening_factor * self.dim, self.dim) for _ in range(self.layers)])
-        self.linear_u = nn.Linear(self.dim, self.out_dim)
-        self.linear_v = nn.Linear(self.dim, self.out_dim)
-
-        self.learned_temp = nn.Parameter(torch.tensor(cosine_temp_init))
-        self.final_matrix_bias = nn.Parameter(torch.tensor(logit_bias_init))
-
     def forward(self, x, is_training: bool):
+        
         dropout_rate = self.dropout if is_training else 0.0
-        z = self.linear(x)
+        z = nn.Linear(self.dim, self.dim)(x)
 
-        layer_norm_idx = 0
-        for i in range(self.layers):
-            q_in = self.layer_norms[layer_norm_idx](z)
-            k_in = self.layer_norms[layer_norm_idx + 1](z)
-            v_in = self.layer_norms[layer_norm_idx + 2](z)
-            layer_norm_idx += 3
-
-            z_attn, _ = self.attentions[i](q_in, k_in, v_in)
+        for _ in range(self.layers):
+            # mha
+            import pdb; pdb.set_trace()
+            q_in = layer_norm(self.dim)(z) # query
+            k_in = layer_norm(self.dim)(z) # key 
+            v_in = layer_norm(self.dim)(z) # value
+            z_attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=self.num_heads, kdim=self.key_size)(q_in, k_in, v_in)
             z = z + F.dropout(z_attn, dropout_rate)
 
             # ffn
-            z_in = self.layer_norms[layer_norm_idx](z)
-            layer_norm_idx += 1
-            z_ffn = F.relu(self.linears1[i](z_in))
-            z_ffn = F.dropout(self.linears2[i](z_ffn), dropout_rate)
-            z = z + z_ffn
+            z_in = layer_norm(self.dim)(z)
+            # This doesn;t have the right initialisation and dimensions will cause an issue
+            z_ffn = nn.Sequential(
+                    nn.Linear(self.widening_factor * self.dim, self.dim), 
+                    nn.ReLU(),
+                    nn.Linear(self.dim, self.dim)
+                )(z_in)
+            z = z + F.dropout(z_ffn, dropout_rate)
 
             # flip N and d axes
             z = torch.swapaxes(z, -3, -2)
 
-        z = self.layer_norms[layer_norm_idx](z)
-        # Make sure z and x have the same shape along the last two dimensions
+        z = layer_norm(self.dim)(z)
         assert z.shape[-2] == x.shape[-2] and z.shape[-3] == x.shape[-3], "Do we have an odd number of layers?"
 
         # [..., n_vars, dim]
         z = torch.max(z, dim=-3)
 
         # u, v dibs embeddings for edge probabilities
-        u = nn.Sequential(
-            nn.LayerNorm(self.ln_axis),
-            nn.Linear(self.out_dim, bias=True))(z)
-        v = nn.Sequential(
-            nn.LayerNorm(self.ln_axis),
-            nn.Linear(self.out_dim, bias=True))(z)
+         # This doesn;t have the right initialisation and dimensions will cause an issue
+        u = nn.Sequential([
+            layer_norm(axis=self.dim),
+            nn.Linear(self.dim, self.out_dim),
+        ])(z)
+        v = nn.Sequential([
+            layer_norm(self.dim),
+            nn.Linear(self.dim, self.out_dim, bias=True),
+        ])(z)
 
         # edge logits
         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
         u /= torch.linalg.norm(u, dim=-1, ord=2, keepdim=True)
         v /= torch.linalg.norm(v, dim=-1, ord=2, keepdim=True)
         logit_ij = torch.einsum("...id,...jd->...ij", u, v)
-        temp = nn.Parameter(torch.tensor(self.cosine_temp_init).unsqueeze(0).unsqueeze(0).unsqueeze(0))
+        temp = torch.nn.Parameter(torch.zeros(1, 1, 1), requires_grad=True)
+        init.constant_(temp, self.cosine_temp_init)
+        temp = temp.squeeze()
         logit_ij *= torch.exp(temp)
-        logit_ij_bias = nn.Parameter(torch.tensor(self.logit_bias_init).unsqueeze(0).unsqueeze(0).unsqueeze(0))
+        logit_ij_bias = nn.Parameter(torch.Tensor([1, 1, 1]))
+        init.constant_(logit_ij_bias, self.logit_bias_init)
+        logit_ij_bias = logit_ij_bias.squeeze()
         logit_ij += logit_ij_bias
 
         assert logit_ij.shape[-1] == x.shape[-2] and logit_ij.shape[-2] == x.shape[-2]
         return logit_ij
+    
 
 class InferenceModel(nn.Module):
 
@@ -154,7 +140,6 @@ class InferenceModel(nn.Module):
                  ):
 
         super(InferenceModel, self).__init__()
-
         self._train_p_obs_only = torch.tensor(train_p_obs_only)
         self._acyclicity_weight = acyclicity
         self._acyclicity_power_iters = acyclicity_pow_iters
@@ -211,7 +196,7 @@ class InferenceModel(nn.Module):
         """
         # [..., d, d]
         logits = self.net(x, is_training)
-        logp_edges = torch.logsigmoid(logits)
+        logp_edges = torch.nn.LogSigmoid(logits)
         if self.mask_diag:
             logp_edges = self.set_diagonal(logp_edges, float('-inf'))
 
@@ -295,8 +280,8 @@ class InferenceModel(nn.Module):
         logits = self.net(params, subk, x, is_training)
 
         # get logits [..., d, d]
-        logp1 = torch.logsigmoid(  logits)
-        logp0 = torch.logsigmoid(- logits)
+        logp1 = torch.nn.LogSigmoid(  logits)
+        logp0 = torch.nn.LogSigmoid(- logits)
 
         # labels [..., d, d]
         y_soft = data["g"]
