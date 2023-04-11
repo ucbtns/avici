@@ -71,10 +71,10 @@ def torch_standardize_default_simple(x):
     """_torch_standardize_default but with only one argument"""
     # default z-standardization
     ref_x = x[..., 0]
-    mean = ref_x.mean(dim=-2, keepdim=True)
-    std = ref_x.std(dim=-2, keepdim=True)
+    mean = torch.mean(ref_x, dim=-2, keepdim=True)
+    std = torch.std(ref_x, dim=-2, keepdim=True)
     x = x.clone().detach()
-    x[..., 0] = (x[..., 0] - mean) / torch.where(std == 0.0, torch.tensor(1.0), std)
+    x[..., 0] = (x[..., 0] - mean) / torch.where(std == 0.0, torch.tensor(1.0, dtype=std.dtype), std)
     return x
 
 

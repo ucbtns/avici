@@ -6,13 +6,12 @@ import warnings
 from tqdm.auto import tqdm
 from pathlib import Path
 
-import jax
+import torch
 import numpy as onp
-import jax.numpy as jnp
 
-from avici.model import BaseModel, InferenceModel
+from avici.model_torch import BaseModel, InferenceModel
 from avici.utils.load import load_checkpoint
-from avici.utils.data_jax import jax_standardize_default_simple, jax_standardize_count_simple
+from avici.utils.data_torch import torch_standardize_default_simple, torch_standardize_count_simple
 from avici.definitions import CACHE_SUBDIR, CHECKPOINT_KWARGS, HUGGINGFACE_REPO, \
     MODEL_NEURIPS_LINEAR, MODEL_NEURIPS_RFF, MODEL_NEURIPS_GRN, MODEL_NEURIPS_SCM_V0
 
@@ -31,7 +30,7 @@ class AVICIModel:
             this is technically not needed, but it is used to issue a warning in case the model expects counts
             but gets non-integer data (in case, for example, the data is accidentally standardized before `__call__`.
         standardizer: function standardizing the data prior to the forward pass.
-            Default is `jax_standardize_default_simple` from `avici.utils.data_jax`, which performs the usual
+            Default is `torch_standardize_default_simple` from `avici.utils.data_torch`, which performs the usual
             z-standardization for real-valued data.
 
     """
@@ -40,7 +39,7 @@ class AVICIModel:
                  params,
                  model,
                  expects_counts,
-                 standardizer=jax_standardize_default_simple,
+                 standardizer=torch_standardize_default_simple,
                  ):
 
         self.params = params
@@ -49,16 +48,16 @@ class AVICIModel:
         self._standardizer = standardizer
 
 
-    @functools.partial(jax.jit, static_argnums=(0,))
+    # @functools.partial(jax.jit, static_argnums=(0,))
     def __call_main__(self, x, interv=None):
         # concatenate intervention indicators
         if interv is None:
-            x = jnp.stack([x, jnp.zeros_like(x)], axis=-1)
+            x = torch.stack([x, torch.zeros_like(x)], axis=-1)
         else:
             assert x.shape == interv.shape
-            x = jnp.stack([x, interv.astype(x.dtype)], axis=-1)
-        
-        # standardize data
+            x = torch.stack([x, interv.astype(x.dtype)], axis=-1)
+
+        # standardize data = [d, n, 2]
         x = self._standardizer(x)
 
         # forward pass through inference model
@@ -68,7 +67,6 @@ class AVICIModel:
 
     def __call__(self, x, interv=None, return_probs=True):
         """
-        Wraps __call_main__ to do some tests and warnings before jax.jit
 
         Args:
             x: `[n, d]` Real-valued data matrix
@@ -194,9 +192,9 @@ def load_pretrained(download=None, force_download=False, checkpoint_dir=None, ca
 
     # select data standardizer
     if expects_counts:
-        standardizer = jax_standardize_count_simple
+        standardizer = torch_standardize_count_simple
     else:
-        standardizer = jax_standardize_default_simple
+        standardizer = torch_standardize_default_simple
 
     # load checkpoint
     state, loaded_config = load_checkpoint(root_path)
@@ -216,13 +214,15 @@ def load_pretrained(download=None, force_download=False, checkpoint_dir=None, ca
     # init model
     inference_model = InferenceModel(**inference_model_kwargs,
                                      model_class=BaseModel,
-                                     model_kwargs=neural_net_kwargs)
+                                     model_kwargs=neural_net_kwargs,
+                                     params=state.params)
 
     model = AVICIModel(
         params=state.params,
         model=inference_model,
         expects_counts=expects_counts,
         standardizer=standardizer,
+
     )
 
     return model

@@ -16,13 +16,10 @@ import functools
 import numpy as np
 
 from avici.utils.data_torch import torch_get_train_x, torch_get_x 
+from avici.utils.multihead import MultiHeadAttention
 
 def layer_norm(shape):
     return nn.LayerNorm(normalized_shape=shape, elementwise_affine=True)
-
-# def set_diagonal(arr, val):
-#     n_vars = arr.shape[-1]
-#     return arr.transpose(-1, -2).masked_fill(torch.eye(n_vars, dtype=torch.bool), val).transpose(-1, -2)
 
 def set_diagonal(tensor, value):
         """
@@ -63,53 +60,74 @@ class BaseModel(nn.Module):
         self.key_size = key_size
         self.logit_bias_init = logit_bias_init
         self.cosine_temp_init = cosine_temp_init
-        # self.w_init = hk.initializers.VarianceScaling(2.0, "fan_in", "uniform")  # kaiming uniform/
         self.w_init = functools.partial(init.kaiming_uniform_, a=2.0, mode='fan_in', nonlinearity='relu')
 
-    def forward(self, x, is_training: bool):
-        
-        dropout_rate = self.dropout if is_training else 0.0
-        z = nn.Linear(self.dim, self.dim)(x)
+        # Initialisation
+        self.linear_layer_1 = nn.Linear(2, self.dim) 
 
-        for _ in range(self.layers):
+        # Inside the attention loop:
+        self.layer_norms = nn.ModuleList([layer_norm(self.dim) for _ in range(self.layers * (3+1))])
+        self.attentions = nn.ModuleList([MultiHeadAttention(num_heads=self.num_heads,
+                                                            key_size=self.key_size, 
+                                                            w_init_scale=2.0,
+                                                            model_size=self.dim,)for _ in range(self.layers)])
+        self.linear_layers_1 = nn.ModuleList([nn.Linear(self.dim, self.widening_factor * self.dim) for _ in range(self.layers)])
+        [self.w_init(self.linear_layers_1[i].weight) for i in range(self.layers)]
+        self.linear_layers_2 = nn.ModuleList([nn.Linear(self.widening_factor * self.dim, self.dim) for _ in range(self.layers)])
+        [self.w_init(self.linear_layers_2[i].weight) for i in range(self.layers)]
+
+        self.layer_norm_1 = layer_norm(self.dim)
+        
+        # Edge Probs - u,v
+        self.layer_norm_u = layer_norm(self.dim)
+        self.linear_u = nn.Linear(self.dim, self.dim)
+        self.w_init(self.linear_u.weight)
+
+        self.layer_norm_v = layer_norm(self.dim)
+        self.linear_v = nn.Linear(self.dim, self.dim)
+        self.w_init(self.linear_v.weight)
+
+        
+        
+    def forward(self, x, is_training: bool):
+
+        dropout_rate = self.dropout if is_training else 0.0
+        z = self.linear_layer_1(x) # [n,d,2] --> [n, d, dim]
+
+        layer_norm_idx = 0
+        for i in range(self.layers):
             # mha
-            import pdb; pdb.set_trace()
-            q_in = layer_norm(self.dim)(z) # query
-            k_in = layer_norm(self.dim)(z) # key 
-            v_in = layer_norm(self.dim)(z) # value
-            z_attn = nn.MultiheadAttention(embed_dim=self.dim, num_heads=self.num_heads, kdim=self.key_size)(q_in, k_in, v_in)
-            z = z + F.dropout(z_attn, dropout_rate)
+            q_in = self.layer_norms[layer_norm_idx](z) # query --> [n, d, dim]
+            k_in = self.layer_norms[layer_norm_idx + 1](z) # key --> [n, d, dim]
+            v_in = self.layer_norms[layer_norm_idx + 2](z) # value --> [n, d, dim]
+            layer_norm_idx += 3
+
+            z_attn = self.attentions[i](q_in, k_in, v_in) # [n, d, dim]
+            z = z + F.dropout(z_attn, dropout_rate) # [n, d, dim]
 
             # ffn
-            z_in = layer_norm(self.dim)(z)
-            # This doesn;t have the right initialisation and dimensions will cause an issue
-            z_ffn = nn.Sequential(
-                    nn.Linear(self.widening_factor * self.dim, self.dim), 
-                    nn.ReLU(),
-                    nn.Linear(self.dim, self.dim)
-                )(z_in)
+            z_in = self.layer_norms[layer_norm_idx](z)# [n, d, dim]
+            layer_norm_idx += 1
+            z_ffn_1 = nn.ReLU()(self.linear_layers_1[i](z_in))
+            z_ffn = self.linear_layers_2[i](z_ffn_1)
             z = z + F.dropout(z_ffn, dropout_rate)
 
             # flip N and d axes
             z = torch.swapaxes(z, -3, -2)
-
-        z = layer_norm(self.dim)(z)
+        
+        z = self.layer_norm_1(z)
         assert z.shape[-2] == x.shape[-2] and z.shape[-3] == x.shape[-3], "Do we have an odd number of layers?"
 
         # [..., n_vars, dim]
-        z = torch.max(z, dim=-3)
+        z,_ = torch.max(z, dim=-3)
 
         # u, v dibs embeddings for edge probabilities
-         # This doesn;t have the right initialisation and dimensions will cause an issue
-        u = nn.Sequential([
-            layer_norm(axis=self.dim),
-            nn.Linear(self.dim, self.out_dim),
-        ])(z)
-        v = nn.Sequential([
-            layer_norm(self.dim),
-            nn.Linear(self.dim, self.out_dim, bias=True),
-        ])(z)
-
+        u_norm =  self.layer_norm_u(z)# [n, d, dim]
+        u = self.linear_u(u_norm)
+        
+        v_norm =  self.layer_norm_v(z)# [n, d, dim]
+        v = self.linear_v(v_norm)
+       
         # edge logits
         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
         u /= torch.linalg.norm(u, dim=-1, ord=2, keepdim=True)
@@ -119,7 +137,7 @@ class BaseModel(nn.Module):
         init.constant_(temp, self.cosine_temp_init)
         temp = temp.squeeze()
         logit_ij *= torch.exp(temp)
-        logit_ij_bias = nn.Parameter(torch.Tensor([1, 1, 1]))
+        logit_ij_bias = nn.Parameter(torch.Tensor([1]))
         init.constant_(logit_ij_bias, self.logit_bias_init)
         logit_ij_bias = logit_ij_bias.squeeze()
         logit_ij += logit_ij_bias
@@ -137,6 +155,7 @@ class InferenceModel(nn.Module):
                  acyclicity=None,
                  acyclicity_pow_iters=10,
                  mask_diag=True,
+                 params=None,
                  ):
 
         super(InferenceModel, self).__init__()
@@ -144,6 +163,7 @@ class InferenceModel(nn.Module):
         self._acyclicity_weight = acyclicity
         self._acyclicity_power_iters = acyclicity_pow_iters
         self.mask_diag = mask_diag
+        self.sigmoid = nn.LogSigmoid()
 
         # filter deprecated network kwargs
         sig = signature(model_class.__init__).parameters
@@ -154,6 +174,7 @@ class InferenceModel(nn.Module):
 
         # init forward pass transform
         self.net = model_class(**model_kwargs)
+        import pdb; pdb.set_trace()
 
     def forward(self, *args):
         # Pass the input arguments to the model and return the result.
@@ -196,9 +217,10 @@ class InferenceModel(nn.Module):
         """
         # [..., d, d]
         logits = self.net(x, is_training)
-        logp_edges = torch.nn.LogSigmoid(logits)
+        logp_edges = self.sigmoid(logits)
+
         if self.mask_diag:
-            logp_edges = self.set_diagonal(logp_edges, float('-inf'))
+            logp_edges = set_diagonal(logp_edges, float('-inf'))
 
         return logp_edges
     
@@ -327,3 +349,97 @@ class InferenceModel(nn.Module):
             "mean_z_norm": torch.abs(logits).mean(),
         }
         return loss, aux
+
+
+
+# class BaseModel_FF(nn.Module):
+
+#     def __init__(self,
+#                  layers=8,
+#                  dim=128,
+#                  key_size=32,
+#                  num_heads=8,
+#                  widening_factor=4,
+#                  dropout=0.1,
+#                  out_dim=None,
+#                  logit_bias_init=-3.0,
+#                  cosine_temp_init=0.0,
+#                  ln_axis=-1,
+#                  name="BaseModel",
+#                  ):
+        
+#         super(BaseModel, self).__init__()
+#         self.dim = dim
+#         self.out_dim = out_dim or dim
+#         self.layers = 2 * layers
+#         self.dropout = dropout
+#         self.ln_axis = ln_axis
+#         self.widening_factor = widening_factor
+#         self.num_heads = num_heads
+#         self.key_size = key_size
+#         self.logit_bias_init = logit_bias_init
+#         self.cosine_temp_init = cosine_temp_init
+#         self.w_init = functools.partial(init.kaiming_uniform_, a=2.0, mode='fan_in', nonlinearity='relu')
+
+#     def forward(self, x, is_training: bool):
+
+#         dropout_rate = self.dropout if is_training else 0.0
+#         z = nn.Linear(2, self.dim)(x) # [n,d,2] --> [n, d, dim]
+
+#         for _ in range(self.layers):
+#             # mha
+#             q_in = layer_norm(self.dim)(z) # query --> [n, d, dim]
+#             k_in = layer_norm(self.dim)(z) # key --> [n, d, dim]
+#             v_in = layer_norm(self.dim)(z) # value --> [n, d, dim]
+#             z_attn = MultiHeadAttention(num_heads=self.num_heads,key_size=self.key_size, w_init_scale=2.0,model_size=self.dim,)(q_in, k_in, v_in) # [n, d, dim]
+#             z = z + F.dropout(z_attn, dropout_rate) # [n, d, dim]
+
+#             # ffn
+#             z_in = layer_norm(self.dim)(z)# [n, d, dim]
+#             z_ffn_layer_1  = nn.Linear(self.dim, self.widening_factor * self.dim)
+#             self.w_init(z_ffn_layer_1.weight)
+#             z_ffn_1 = nn.ReLU()(z_ffn_layer_1(z_in))
+
+#             z_ffn_layer_2 = nn.Linear(self.widening_factor * self.dim, self.dim)
+#             self.w_init(z_ffn_layer_2.weight)
+#             z_ffn = z_ffn_layer_2(z_ffn_1)
+#             z = z + F.dropout(z_ffn, dropout_rate)
+
+#             # flip N and d axes
+#             z = torch.swapaxes(z, -3, -2)
+
+#         z = layer_norm(self.dim)(z)
+#         assert z.shape[-2] == x.shape[-2] and z.shape[-3] == x.shape[-3], "Do we have an odd number of layers?"
+
+#         # [..., n_vars, dim]
+#         z,_ = torch.max(z, dim=-3)
+
+#         # u, v dibs embeddings for edge probabilities
+#          # This doesn;t have the right initialisation and dimensions will cause an issue
+#         u_norm = layer_norm(self.dim)(z)# [n, d, dim]
+#         u_norm_layer = nn.Linear(self.dim, self.dim)
+#         self.w_init(u_norm_layer.weight)
+#         u = u_norm_layer(u_norm)
+        
+#         v_norm = layer_norm(self.dim)(z)# [n, d, dim]
+#         v_norm_layer = nn.Linear(self.dim, self.dim)
+#         self.w_init(v_norm_layer.weight)
+#         v = v_norm_layer(u_norm)
+       
+#         # edge logits
+#         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
+#         u /= torch.linalg.norm(u, dim=-1, ord=2, keepdim=True)
+#         v /= torch.linalg.norm(v, dim=-1, ord=2, keepdim=True)
+#         logit_ij = torch.einsum("...id,...jd->...ij", u, v)
+#         temp = torch.nn.Parameter(torch.zeros(1, 1, 1), requires_grad=True)
+#         init.constant_(temp, self.cosine_temp_init)
+#         temp = temp.squeeze()
+#         logit_ij *= torch.exp(temp)
+#         logit_ij_bias = nn.Parameter(torch.Tensor([1]))
+#         init.constant_(logit_ij_bias, self.logit_bias_init)
+#         logit_ij_bias = logit_ij_bias.squeeze()
+#         logit_ij += logit_ij_bias
+
+#         assert logit_ij.shape[-1] == x.shape[-2] and logit_ij.shape[-2] == x.shape[-2]
+#         return logit_ij
+    

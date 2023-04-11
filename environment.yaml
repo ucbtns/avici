@@ -1,4 +1,4 @@
-name: avici
+name: avici_jax
 channels:
 - conda-forge
 - defaults

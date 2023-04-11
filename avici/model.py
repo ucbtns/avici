@@ -47,31 +47,20 @@ class BaseModel(hk.Module):
         self.cosine_temp_init = cosine_temp_init
         self.w_init = hk.initializers.VarianceScaling(2.0, "fan_in", "uniform")  # kaiming uniform
 
-
     def __call__(self, x, is_training: bool):
         dropout_rate = self.dropout if is_training else 0.0
-        z = hk.Linear(self.dim)(x)
-
+        z = hk.Linear(self.dim)(x) # [n,d,2] --> [n, d, dim]
         for _ in range(self.layers):
             # mha
-            q_in = layer_norm(axis=self.ln_axis)(z)
-            k_in = layer_norm(axis=self.ln_axis)(z)
-            v_in = layer_norm(axis=self.ln_axis)(z)
-            z_attn = hk.MultiHeadAttention(
-                num_heads=self.num_heads,
-                key_size=self.key_size,
-                w_init_scale=2.0,
-                model_size=self.dim,
-            )(q_in, k_in, v_in)
+            q_in = layer_norm(axis=self.ln_axis)(z) # query --> [n, d, dim]
+            k_in = layer_norm(axis=self.ln_axis)(z) # key --> [n, d, dim]
+            v_in = layer_norm(axis=self.ln_axis)(z) # value --> [n, d, dim]
+            z_attn = hk.MultiHeadAttention(num_heads=self.num_heads,key_size=self.key_size, w_init_scale=2.0,model_size=self.dim,)(q_in, k_in, v_in) # [n, d, dim]
             z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_attn)
 
             # ffn
             z_in = layer_norm(axis=self.ln_axis)(z)
-            z_ffn = hk.Sequential([
-                hk.Linear(self.widening_factor * self.dim, w_init=self.w_init),
-                jax.nn.relu,
-                hk.Linear(self.dim, w_init=self.w_init),
-            ])(z_in)
+            z_ffn = hk.Sequential([hk.Linear(self.widening_factor * self.dim, w_init=self.w_init),jax.nn.relu,hk.Linear(self.dim, w_init=self.w_init),])(z_in)
             z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_ffn)
 
             # flip N and d axes
@@ -84,14 +73,8 @@ class BaseModel(hk.Module):
         z = jnp.max(z, axis=-3)
 
         # u, v dibs embeddings for edge probabilities
-        u = hk.Sequential([
-            layer_norm(axis=self.ln_axis),
-            hk.Linear(self.out_dim, w_init=self.w_init),
-        ])(z)
-        v = hk.Sequential([
-            layer_norm(axis=self.ln_axis),
-            hk.Linear(self.out_dim, w_init=self.w_init),
-        ])(z)
+        u = hk.Sequential([layer_norm(axis=self.ln_axis),hk.Linear(self.out_dim, w_init=self.w_init),])(z)
+        v = hk.Sequential([layer_norm(axis=self.ln_axis),hk.Linear(self.out_dim, w_init=self.w_init),])(z)
 
         # edge logits
         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
@@ -101,8 +84,8 @@ class BaseModel(hk.Module):
         temp = hk.get_parameter("learned_temp", (1, 1, 1), logit_ij.dtype,
                                 init=hk.initializers.Constant(self.cosine_temp_init)).squeeze()
         logit_ij *= jnp.exp(temp)
-        logit_ij_bias = hk.get_parameter("final_matrix_bias", (1, 1, 1), logit_ij.dtype,
-                                         init=hk.initializers.Constant(self.logit_bias_init)).squeeze()
+  
+        logit_ij_bias = hk.get_parameter("final_matrix_bias", (1, 1, 1), logit_ij.dtype,init=hk.initializers.Constant(self.logit_bias_init)).squeeze()
         logit_ij += logit_ij_bias
 
         assert logit_ij.shape[-1] == x.shape[-2] and logit_ij.shape[-2] == x.shape[-2]
@@ -181,7 +164,6 @@ class InferenceModel:
         logp_edges = jax.nn.log_sigmoid(logits)
         if self.mask_diag:
             logp_edges = set_diagonal(logp_edges, -jnp.inf)
-
         return logp_edges
 
 
