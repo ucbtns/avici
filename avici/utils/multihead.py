@@ -75,6 +75,27 @@ class MultiHeadAttention(nn.Module):
 
     self.w_init = variance_scaling(w_init_scale, 'average')
 
+    self.query = nn.Linear(self.model_size, self.num_heads * self.key_size)
+    self.w_init(self.query.weight)
+
+    self.key = nn.Linear(self.model_size, self.num_heads * self.key_size)
+    self.w_init(self.key.weight)
+
+    self.value = nn.Linear(self.model_size, self.num_heads * self.value_size)
+    self.w_init(self.value.weight)
+
+    self.linear = nn.Linear(self.num_heads * self.key_size, self.model_size)
+    self.w_init(self.linear.weight)
+
+  def _linear_projection(
+          self, y_linear: nn.Linear, x: torch.Tensor, head_size: int) -> torch.Tensor:
+      # self, y_linear: nn.Linear, x: torch.Tensor, head_size: int) -> torch.Tensor:
+    # y_linear = nn.Linear(self.model_size, self.num_heads * head_size)
+    # self.w_init(y_linear.weight)
+    y = y_linear(x)
+    *leading_dims, _ = x.shape
+    return y.reshape((*leading_dims, self.num_heads, head_size))
+  
   def __call__(
       self,
       query: torch.Tensor,
@@ -89,9 +110,9 @@ class MultiHeadAttention(nn.Module):
     projection = self._linear_projection
 
     # Compute key/query/values (overload K/Q/V to denote the respective sizes).
-    query_heads = projection(query, self.key_size)  # [T', H, Q=K]
-    key_heads = projection(key, self.key_size)  # [T, H, K]
-    value_heads = projection(value, self.value_size)  # [T, H, V]
+    query_heads = projection(self.query, query, self.key_size)  # [T', H, Q=K]
+    key_heads = projection(self.key, key, self.key_size)  # [T, H, K]
+    value_heads = projection(self.value, value, self.value_size)  # [T, H, V]
   
     # Compute attention weights.
     attn_logits = torch.einsum("...thd,...Thd->...htT", query_heads, key_heads)
@@ -101,17 +122,7 @@ class MultiHeadAttention(nn.Module):
     # Weight the values by the attention and flatten the head vectors.
     attn = torch.einsum("...htT,...Thd->...thd", attn_weights, value_heads)
     attn = torch.reshape(attn, (*leading_dims, sequence_length, -1))  # [T', H*V]
-
+    
     # Apply another projection to get the final embeddings.
-    final_projection = nn.Linear(self.num_heads * self.key_size, self.model_size)
-    self.w_init(final_projection.weight)
-    return final_projection(attn)  # [T', D']
+    return self.linear(attn)  # [T', D']
 
-  def _linear_projection(
-      self, x: torch.Tensor, head_size: int) -> torch.Tensor:
-    y_linear = nn.Linear(self.model_size, self.num_heads * head_size)
-    self.w_init(y_linear.weight)
-    y = y_linear(x)
-    *leading_dims, _ = x.shape
-    return y.reshape((*leading_dims, self.num_heads, head_size))
-  
