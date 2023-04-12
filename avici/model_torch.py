@@ -38,6 +38,8 @@ linear_1_list = list(linear_1_mapping.keys())
 linear_2_mapping = {"2": 0,"4": 1,"6": 2, "8": 3, "10": 4,"12": 5,"14": 6,"16": 7,"18": 8,"20": 9, "22": 10,"24": 11, "26": 12, "28": 13,"30": 14,"32": 15,}
 linear_2_list = list(linear_2_mapping.keys())
 
+dtype = torch.float64
+
 class BaseModel(nn.Module):
 
     def __init__(self,
@@ -110,56 +112,56 @@ class BaseModel(nn.Module):
                     layers = split_key[1].split('_')
                     if layers[0] == 'layer':
                         if layer_count < 64:
-                            self.layer_norms[layer_count].weight.copy_(torch.tensor(params[key]['offset']))
-                            self.layer_norms[layer_count].bias.copy_(torch.tensor(params[key]['scale']))
+                            self.layer_norms[layer_count].weight.copy_(torch.tensor(params[key]['offset'], dtype ==dtype))
+                            self.layer_norms[layer_count].bias.copy_(torch.tensor(params[key]['scale'], dtype ==dtype))
                         elif layer_count == 64:
-                            self.layer_norm_1.weight.copy_(torch.tensor(params[key]['offset']))
-                            self.layer_norm_1.bias.copy_(torch.tensor(params[key]['scale']))
+                            self.layer_norm_1.weight.copy_(torch.tensor(params[key]['offset'], dtype ==dtype))
+                            self.layer_norm_1.bias.copy_(torch.tensor(params[key]['scale'], dtype ==dtype))
                         elif layer_count == 65:
-                            self.layer_norm_u.weight.copy_(torch.tensor(params[key]['offset']))
-                            self.layer_norm_u.bias.copy_(torch.tensor(params[key]['scale']))
+                            self.layer_norm_u.weight.copy_(torch.tensor(params[key]['offset'], dtype ==dtype))
+                            self.layer_norm_u.bias.copy_(torch.tensor(params[key]['scale'], dtype ==dtype))
                         elif layer_count == 66:
-                            self.layer_norm_v.weight.copy_(torch.tensor(params[key]['offset']))
-                            self.layer_norm_v.bias.copy_(torch.tensor(params[key]['scale']))
+                            self.layer_norm_v.weight.copy_(torch.tensor(params[key]['offset'], dtype ==dtype))
+                            self.layer_norm_v.bias.copy_(torch.tensor(params[key]['scale'], dtype ==dtype))
                         layer_count += 1
                     elif layers[0] == 'linear':
                         if linear_count == 0:
-                            self.linear_layer_1.weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.linear_layer_1.bias.copy_(torch.tensor(params[key]['b']))
+                            self.linear_layer_1.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.linear_layer_1.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                         elif layers[-1] in linear_1_list:
-                            self.linear_layers_1[linear_1_mapping[layers[-1]]].weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.linear_layers_1[linear_1_mapping[layers[-1]]].bias.copy_(torch.tensor(params[key]['b']))
+                            self.linear_layers_1[linear_1_mapping[layers[-1]]].weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.linear_layers_1[linear_1_mapping[layers[-1]]].bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                             linear_1_count += 1
                         elif layers[-1] in linear_2_list:
-                            self.linear_layers_2[linear_2_mapping[layers[-1]]].weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.linear_layers_2[linear_2_mapping[layers[-1]]].bias.copy_(torch.tensor(params[key]['b']))
+                            self.linear_layers_2[linear_2_mapping[layers[-1]]].weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.linear_layers_2[linear_2_mapping[layers[-1]]].bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                             linear_2_count += 1
                         elif layers[-1] == 33:
-                            self.linear_u.weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.linear_u.bias.copy_(torch.tensor(params[key]['b']))
+                            self.linear_u.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.linear_u.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                         elif layers[-1] == 34:
-                            self.linear_v.weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.linear_v.bias.copy_(torch.tensor(params[key]['b']))
+                            self.linear_v.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.linear_v.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                         linear_count += 1
                     elif layers[0] == 'multi':
                         if len(layers) == 3: nid = 0
                         else: nid = int(layers[-1])   
                         if split_key[-1] == 'key':
-                            self.attentions[nid].key.weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.attentions[nid].key.bias.copy_(torch.tensor(params[key]['b']))
+                            self.attentions[nid].key.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.attentions[nid].key.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                         elif split_key[-1] == 'query':
-                            self.attentions[nid].query.weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.attentions[nid].query.bias.copy_(torch.tensor(params[key]['b']))
+                            self.attentions[nid].query.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.attentions[nid].query.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                         elif split_key[-1] == 'value':
-                            self.attentions[nid].value.weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.attentions[nid].value.bias.copy_(torch.tensor(params[key]['b']))
+                            self.attentions[nid].value.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.attentions[nid].value.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                         elif split_key[-1] == 'linear':
-                            self.attentions[nid].linear.weight.copy_(torch.tensor(params[key]['w']).T)
-                            self.attentions[nid].linear.bias.copy_(torch.tensor(params[key]['b']))
+                            self.attentions[nid].linear.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
+                            self.attentions[nid].linear.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
                 except: 
-                    # import pdb; pdb.set_trace()
-                    self.temp = torch.nn.Parameter(torch.tensor(params[key]['learned_temp']),requires_grad=False)
-                    self.logit_ij_bias = torch.nn.Parameter(torch.tensor(params[key]['final_matrix_bias']),requires_grad=False)
+                    import pdb; pdb.set_trace()
+                    self.temp = torch.nn.Parameter(torch.tensor(params[key]['learned_temp'], dtype=dtype),requires_grad=False)
+                    self.logit_ij_bias = torch.nn.Parameter(torch.tensor(params[key]['final_matrix_bias'], dtype ==dtype),requires_grad=False)
             
         return self.children()
                           
@@ -287,6 +289,7 @@ class InferenceModel(nn.Module):
         child = self.net.set_params(params)
         self.net.children = child
         logits = self.net(x, is_training)
+        import pdb; pdb.set_trace()
         logp_edges = self.sigmoid(logits)
 
         if self.mask_diag:

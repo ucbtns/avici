@@ -161,6 +161,7 @@ class InferenceModel:
         """
         # [..., d, d]
         logits = self.net.apply(params, rng, x, is_training)
+        import pdb; pdb.set_trace()
         logp_edges = jax.nn.log_sigmoid(logits)
         if self.mask_diag:
             logp_edges = set_diagonal(logp_edges, -jnp.inf)

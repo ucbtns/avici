@@ -61,6 +61,7 @@ class AVICIModel:
         x = self._standardizer(x)
 
         # forward pass through inference model
+        import pdb; pdb.set_trace()
         g_edges_prob = self._model.infer_edge_probs(self.params, x)
         return g_edges_prob
 
