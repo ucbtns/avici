@@ -49,7 +49,7 @@ class AVICIModel:
         self._standardizer = standardizer
 
 
-    # @functools.partial(jax.jit, static_argnums=(0,))
+    @functools.partial(jax.jit, static_argnums=(0,))
     def __call_main__(self, x, interv=None):
         # concatenate intervention indicators
         if interv is None:

@@ -127,7 +127,7 @@ class InferenceModel:
         self.net = hk.transform(lambda *args: model_class(**model_kwargs)(*args))
 
 
-    # @functools.partial(jax.jit, static_argnums=(0, 1))
+    @functools.partial(jax.jit, static_argnums=(0, 1))
     def sample_graphs(self, n_samples, params, rng, x):
         """
         Args:
@@ -154,7 +154,7 @@ class InferenceModel:
         return samples
 
 
-    # @functools.partial(jax.jit, static_argnums=(0, 4))
+    @functools.partial(jax.jit, static_argnums=(0, 4))
     def infer_edge_logprobs(self, params, rng, x, is_training: bool):
         """
         Args:
