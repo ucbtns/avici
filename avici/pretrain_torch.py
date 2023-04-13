@@ -56,12 +56,11 @@ class AVICIModel:
         else:
             assert x.shape == interv.shape
             x = torch.stack([x, interv.astype(x.dtype)], axis=-1)
-
+        # import pdb; pdb.set_trace()
         # standardize data = [d, n, 2]
         x = self._standardizer(x)
 
         # forward pass through inference model
-        import pdb; pdb.set_trace()
         g_edges_prob = self._model.infer_edge_probs(self.params, x)
         return g_edges_prob
 

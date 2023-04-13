@@ -49,7 +49,7 @@ class AVICIModel:
         self._standardizer = standardizer
 
 
-    @functools.partial(jax.jit, static_argnums=(0,))
+    # @functools.partial(jax.jit, static_argnums=(0,))
     def __call_main__(self, x, interv=None):
         # concatenate intervention indicators
         if interv is None:
@@ -57,7 +57,7 @@ class AVICIModel:
         else:
             assert x.shape == interv.shape
             x = jnp.stack([x, interv.astype(x.dtype)], axis=-1)
-        
+        # import pdb; pdb.set_trace()
         # standardize data
         x = self._standardizer(x)
 

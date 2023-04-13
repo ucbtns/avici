@@ -52,6 +52,7 @@ class MultiHeadAttention(nn.Module):
       value_size: Optional[int] = None,
       model_size: Optional[int] = None,
       name: Optional[str] = None,
+      dtype: Optional = torch.float64,
   ):
     """Initialises the module.
     Args:
@@ -72,19 +73,20 @@ class MultiHeadAttention(nn.Module):
     self.key_size = key_size
     self.value_size = value_size or key_size
     self.model_size = model_size or key_size * num_heads
+    self.dtype = dtype
 
     self.w_init = variance_scaling(w_init_scale, 'average')
 
-    self.query = nn.Linear(self.model_size, self.num_heads * self.key_size)
+    self.query = nn.Linear(self.model_size, self.num_heads * self.key_size, dtype=self.dtype)
     self.w_init(self.query.weight)
 
-    self.key = nn.Linear(self.model_size, self.num_heads * self.key_size)
+    self.key = nn.Linear(self.model_size, self.num_heads * self.key_size, dtype=self.dtype)
     self.w_init(self.key.weight)
 
-    self.value = nn.Linear(self.model_size, self.num_heads * self.value_size)
+    self.value = nn.Linear(self.model_size, self.num_heads * self.value_size, dtype=self.dtype)
     self.w_init(self.value.weight)
 
-    self.linear = nn.Linear(self.num_heads * self.key_size, self.model_size)
+    self.linear = nn.Linear(self.num_heads * self.key_size, self.model_size, dtype=self.dtype)
     self.w_init(self.linear.weight)
 
   def _linear_projection(
@@ -117,12 +119,11 @@ class MultiHeadAttention(nn.Module):
     # Compute attention weights.
     attn_logits = torch.einsum("...thd,...Thd->...htT", query_heads, key_heads)
     attn_logits = attn_logits / torch.sqrt(torch.tensor(self.key_size))
-    attn_weights = torch.softmax(attn_logits, dim=-3)  # [H, T', T]
+    attn_weights = torch.softmax(attn_logits, dim=-1) # [H, T', T]
 
     # Weight the values by the attention and flatten the head vectors.
     attn = torch.einsum("...htT,...Thd->...thd", attn_weights, value_heads)
     attn = torch.reshape(attn, (*leading_dims, sequence_length, -1))  # [T', H*V]
-    
     # Apply another projection to get the final embeddings.
     return self.linear(attn)  # [T', D']
 

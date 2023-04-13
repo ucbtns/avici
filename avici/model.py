@@ -1,11 +1,11 @@
+import functools
 import inspect
+
+import haiku as hk
 import jax
 import jax.numpy as jnp
 import jax.random as random
 from jax.scipy.special import logsumexp
-
-import haiku as hk
-import functools
 
 from avici.utils.data_jax import jax_get_train_x, jax_get_x
 
@@ -50,22 +50,30 @@ class BaseModel(hk.Module):
     def __call__(self, x, is_training: bool):
         dropout_rate = self.dropout if is_training else 0.0
         z = hk.Linear(self.dim)(x) # [n,d,2] --> [n, d, dim]
+
         for _ in range(self.layers):
             # mha
             q_in = layer_norm(axis=self.ln_axis)(z) # query --> [n, d, dim]
             k_in = layer_norm(axis=self.ln_axis)(z) # key --> [n, d, dim]
             v_in = layer_norm(axis=self.ln_axis)(z) # value --> [n, d, dim]
-            z_attn = hk.MultiHeadAttention(num_heads=self.num_heads,key_size=self.key_size, w_init_scale=2.0,model_size=self.dim,)(q_in, k_in, v_in) # [n, d, dim]
-            z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_attn)
 
+            z_attn = hk.MultiHeadAttention(num_heads=self.num_heads,key_size=self.key_size, w_init_scale=2.0,model_size=self.dim,)(q_in, k_in, v_in) # [n, d, dim]
+            if is_training:
+                z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_attn)
+            else:
+                z = z + z_attn
+            
             # ffn
             z_in = layer_norm(axis=self.ln_axis)(z)
             z_ffn = hk.Sequential([hk.Linear(self.widening_factor * self.dim, w_init=self.w_init),jax.nn.relu,hk.Linear(self.dim, w_init=self.w_init),])(z_in)
-            z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_ffn)
+            if is_training:
+                z = z + hk.dropout(hk.next_rng_key(), dropout_rate, z_ffn)
+            else:
+                z = z + z_ffn
 
             # flip N and d axes
             z = jnp.swapaxes(z, -3, -2)
-
+      
         z = layer_norm(axis=self.ln_axis)(z)
         assert z.shape[-2] == x.shape[-2] and z.shape[-3] == x.shape[-3], "Do we have an odd number of layers?"
 
@@ -73,16 +81,15 @@ class BaseModel(hk.Module):
         z = jnp.max(z, axis=-3)
 
         # u, v dibs embeddings for edge probabilities
-        u = hk.Sequential([layer_norm(axis=self.ln_axis),hk.Linear(self.out_dim, w_init=self.w_init),])(z)
-        v = hk.Sequential([layer_norm(axis=self.ln_axis),hk.Linear(self.out_dim, w_init=self.w_init),])(z)
-
+        u_edge = hk.Sequential([layer_norm(axis=self.ln_axis),hk.Linear(self.out_dim, w_init=self.w_init),])(z)
+        v_edge = hk.Sequential([layer_norm(axis=self.ln_axis),hk.Linear(self.out_dim, w_init=self.w_init),])(z)
+      
         # edge logits
         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
-        u /= jnp.linalg.norm(u, axis=-1, ord=2, keepdims=True)
-        v /= jnp.linalg.norm(v, axis=-1, ord=2, keepdims=True)
-        logit_ij = jnp.einsum("...id,...jd->...ij", u, v)
-        temp = hk.get_parameter("learned_temp", (1, 1, 1), logit_ij.dtype,
-                                init=hk.initializers.Constant(self.cosine_temp_init)).squeeze()
+        u_edge /= jnp.linalg.norm(u_edge, axis=-1, ord=2, keepdims=True)
+        v_edge /= jnp.linalg.norm(v_edge, axis=-1, ord=2, keepdims=True)
+        logit_ij = jnp.einsum("...id,...jd->...ij", u_edge, v_edge)
+        temp = hk.get_parameter("learned_temp", (1, 1, 1), logit_ij.dtype, init=hk.initializers.Constant(self.cosine_temp_init)).squeeze()
         logit_ij *= jnp.exp(temp)
   
         logit_ij_bias = hk.get_parameter("final_matrix_bias", (1, 1, 1), logit_ij.dtype,init=hk.initializers.Constant(self.logit_bias_init)).squeeze()
@@ -120,7 +127,7 @@ class InferenceModel:
         self.net = hk.transform(lambda *args: model_class(**model_kwargs)(*args))
 
 
-    @functools.partial(jax.jit, static_argnums=(0, 1))
+    # @functools.partial(jax.jit, static_argnums=(0, 1))
     def sample_graphs(self, n_samples, params, rng, x):
         """
         Args:
@@ -147,7 +154,7 @@ class InferenceModel:
         return samples
 
 
-    @functools.partial(jax.jit, static_argnums=(0, 4))
+    # @functools.partial(jax.jit, static_argnums=(0, 4))
     def infer_edge_logprobs(self, params, rng, x, is_training: bool):
         """
         Args:
@@ -161,7 +168,6 @@ class InferenceModel:
         """
         # [..., d, d]
         logits = self.net.apply(params, rng, x, is_training)
-        import pdb; pdb.set_trace()
         logp_edges = jax.nn.log_sigmoid(logits)
         if self.mask_diag:
             logp_edges = set_diagonal(logp_edges, -jnp.inf)

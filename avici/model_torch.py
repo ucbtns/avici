@@ -18,8 +18,8 @@ import numpy as np
 from avici.utils.data_torch import torch_get_train_x, torch_get_x 
 from avici.utils.multihead import MultiHeadAttention
 
-def layer_norm(shape):
-    return nn.LayerNorm(normalized_shape=shape, elementwise_affine=True)
+def layer_norm(shape, dtype = torch.float32):
+    return nn.LayerNorm(normalized_shape=shape, elementwise_affine=True, dtype=dtype)
 
 def set_diagonal(tensor, value):
         """
@@ -38,8 +38,6 @@ linear_1_list = list(linear_1_mapping.keys())
 linear_2_mapping = {"2": 0,"4": 1,"6": 2, "8": 3, "10": 4,"12": 5,"14": 6,"16": 7,"18": 8,"20": 9, "22": 10,"24": 11, "26": 12, "28": 13,"30": 14,"32": 15,}
 linear_2_list = list(linear_2_mapping.keys())
 
-dtype = torch.float64
-
 class BaseModel(nn.Module):
 
     def __init__(self,
@@ -54,6 +52,8 @@ class BaseModel(nn.Module):
                  cosine_temp_init=0.0,
                  ln_axis=-1,
                  name="BaseModel",
+                 dtype=torch.float32, 
+                 grad = False,
                  ):
         
         super(BaseModel, self).__init__()
@@ -68,41 +68,43 @@ class BaseModel(nn.Module):
         self.logit_bias_init = logit_bias_init
         self.cosine_temp_init = cosine_temp_init
         self.w_init = functools.partial(init.kaiming_uniform_, a=2.0, mode='fan_in', nonlinearity='relu')
+        self.dtype= dtype
+        self.grad = grad
 
         # Initialisation
-        self.linear_layer_1 = nn.Linear(2, self.dim) 
+        self.linear_layer_1 = nn.Linear(2, self.dim, dtype=self.dtype) 
 
         # Inside the attention loop:
-        self.layer_norms = nn.ModuleList([layer_norm(self.dim) for _ in range(self.layers * (3+1))])
+        self.layer_norms = nn.ModuleList([layer_norm(self.dim, dtype=self.dtype) for _ in range(self.layers * (3+1))])
         self.attentions = nn.ModuleList([MultiHeadAttention(num_heads=self.num_heads,
                                                             key_size=self.key_size, 
                                                             w_init_scale=2.0,
-                                                            model_size=self.dim,)for _ in range(self.layers)])
-        self.linear_layers_1 = nn.ModuleList([nn.Linear(self.dim, self.widening_factor * self.dim) for _ in range(self.layers)])
+                                                            model_size=self.dim,
+                                                            dtype=self.dtype)for _ in range(self.layers)])
+        self.linear_layers_1 = nn.ModuleList([nn.Linear(self.dim, self.widening_factor * self.dim, dtype=self.dtype) for _ in range(self.layers)])
         [self.w_init(self.linear_layers_1[i].weight) for i in range(self.layers)]
-        self.linear_layers_2 = nn.ModuleList([nn.Linear(self.widening_factor * self.dim, self.dim) for _ in range(self.layers)])
+        self.linear_layers_2 = nn.ModuleList([nn.Linear(self.widening_factor * self.dim, self.dim, dtype=self.dtype) for _ in range(self.layers)])
         [self.w_init(self.linear_layers_2[i].weight) for i in range(self.layers)]
 
-        self.layer_norm_1 = layer_norm(self.dim)
+        self.layer_norm_1 = layer_norm(self.dim, dtype=self.dtype)
         
         # Edge Probs - u,v
-        self.layer_norm_u = layer_norm(self.dim)
-        self.linear_u = nn.Linear(self.dim, self.dim)
+        self.layer_norm_u = layer_norm(self.dim, dtype=self.dtype)
+        self.linear_u = nn.Linear(self.dim, self.dim, dtype=self.dtype)
         self.w_init(self.linear_u.weight)
 
-        self.layer_norm_v = layer_norm(self.dim)
-        self.linear_v = nn.Linear(self.dim, self.dim)
+        self.layer_norm_v = layer_norm(self.dim, dtype=self.dtype)
+        self.linear_v = nn.Linear(self.dim, self.dim, dtype=self.dtype)
         self.w_init(self.linear_v.weight)
 
         # Logit mult:
-        self.temp = nn.Parameter(torch.zeros(1, 1, 1), requires_grad=True)
+        self.temp = nn.Parameter(torch.zeros(1, 1, 1, dtype=self.dtype), requires_grad=True)
         init.constant_(self.temp, self.cosine_temp_init)
         
-        self.logit_ij_bias = nn.Parameter(torch.Tensor([1]))
+        self.logit_ij_bias = nn.Parameter(torch.Tensor([1]).to(self.dtype))
         init.constant_(self.logit_ij_bias, self.logit_bias_init)
     
     def set_params(self, params):
-        layer_count = 0
         linear_count, linear_1_count, linear_2_count = 0,0,0
 
         with torch.no_grad():
@@ -111,62 +113,61 @@ class BaseModel(nn.Module):
                     split_key = key.split('/')
                     layers = split_key[1].split('_')
                     if layers[0] == 'layer':
-                        if layer_count < 64:
-                            self.layer_norms[layer_count].weight.copy_(torch.tensor(params[key]['offset'], dtype ==dtype))
-                            self.layer_norms[layer_count].bias.copy_(torch.tensor(params[key]['scale'], dtype ==dtype))
-                        elif layer_count == 64:
-                            self.layer_norm_1.weight.copy_(torch.tensor(params[key]['offset'], dtype ==dtype))
-                            self.layer_norm_1.bias.copy_(torch.tensor(params[key]['scale'], dtype ==dtype))
-                        elif layer_count == 65:
-                            self.layer_norm_u.weight.copy_(torch.tensor(params[key]['offset'], dtype ==dtype))
-                            self.layer_norm_u.bias.copy_(torch.tensor(params[key]['scale'], dtype ==dtype))
-                        elif layer_count == 66:
-                            self.layer_norm_v.weight.copy_(torch.tensor(params[key]['offset'], dtype ==dtype))
-                            self.layer_norm_v.bias.copy_(torch.tensor(params[key]['scale'], dtype ==dtype))
-                        layer_count += 1
+                        if len(layers) == 2: nid = 0
+                        else: nid = int(layers[-1])  
+                        if nid < 64:
+                            self.layer_norms[nid].bias.copy_(torch.tensor(params[key]['offset'], dtype =self.dtype))
+                            self.layer_norms[nid].weight.copy_(torch.tensor(params[key]['scale'], dtype =self.dtype))
+                        elif nid == 64:
+                            self.layer_norm_1.bias.copy_(torch.tensor(params[key]['offset'], dtype =self.dtype))
+                            self.layer_norm_1.weight.copy_(torch.tensor(params[key]['scale'], dtype =self.dtype))
+                        elif nid == 65:
+                            self.layer_norm_u.bias.copy_(torch.tensor(params[key]['offset'], dtype =self.dtype))
+                            self.layer_norm_u.weight.copy_(torch.tensor(params[key]['scale'], dtype =self.dtype))
+                        elif nid == 66:
+                            self.layer_norm_v.bias.copy_(torch.tensor(params[key]['offset'], dtype =self.dtype))
+                            self.layer_norm_v.weight.copy_(torch.tensor(params[key]['scale'], dtype =self.dtype))
                     elif layers[0] == 'linear':
                         if linear_count == 0:
-                            self.linear_layer_1.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.linear_layer_1.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
+                            self.linear_layer_1.weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.linear_layer_1.bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
                         elif layers[-1] in linear_1_list:
-                            self.linear_layers_1[linear_1_mapping[layers[-1]]].weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.linear_layers_1[linear_1_mapping[layers[-1]]].bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
+                            self.linear_layers_1[linear_1_mapping[layers[-1]]].weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.linear_layers_1[linear_1_mapping[layers[-1]]].bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
                             linear_1_count += 1
                         elif layers[-1] in linear_2_list:
-                            self.linear_layers_2[linear_2_mapping[layers[-1]]].weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.linear_layers_2[linear_2_mapping[layers[-1]]].bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
+                            self.linear_layers_2[linear_2_mapping[layers[-1]]].weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.linear_layers_2[linear_2_mapping[layers[-1]]].bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
                             linear_2_count += 1
-                        elif layers[-1] == 33:
-                            self.linear_u.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.linear_u.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
-                        elif layers[-1] == 34:
-                            self.linear_v.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.linear_v.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
+                        elif layers[-1] == '33':
+                            self.linear_u.weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.linear_u.bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
+                        elif layers[-1] == '34':
+                            self.linear_v.weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.linear_v.bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
                         linear_count += 1
                     elif layers[0] == 'multi':
                         if len(layers) == 3: nid = 0
-                        else: nid = int(layers[-1])   
+                        else: nid = int(layers[-1]) 
                         if split_key[-1] == 'key':
-                            self.attentions[nid].key.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.attentions[nid].key.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
+                            self.attentions[nid].key.weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.attentions[nid].key.bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
                         elif split_key[-1] == 'query':
-                            self.attentions[nid].query.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.attentions[nid].query.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
+                            self.attentions[nid].query.weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.attentions[nid].query.bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
                         elif split_key[-1] == 'value':
-                            self.attentions[nid].value.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.attentions[nid].value.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
+                            self.attentions[nid].value.weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.attentions[nid].value.bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
                         elif split_key[-1] == 'linear':
-                            self.attentions[nid].linear.weight.copy_(torch.tensor(params[key]['w'], dtype ==dtype).T)
-                            self.attentions[nid].linear.bias.copy_(torch.tensor(params[key]['b'], dtype ==dtype))
+                            self.attentions[nid].linear.weight.copy_(torch.tensor(params[key]['w'], dtype =self.dtype).T)
+                            self.attentions[nid].linear.bias.copy_(torch.tensor(params[key]['b'], dtype =self.dtype))
                 except: 
-                    import pdb; pdb.set_trace()
-                    self.temp = torch.nn.Parameter(torch.tensor(params[key]['learned_temp'], dtype=dtype),requires_grad=False)
-                    self.logit_ij_bias = torch.nn.Parameter(torch.tensor(params[key]['final_matrix_bias'], dtype ==dtype),requires_grad=False)
+                    self.temp = torch.nn.Parameter(torch.tensor(params[key]['learned_temp'], dtype=self.dtype),requires_grad=False)
+                    self.logit_ij_bias = torch.nn.Parameter(torch.tensor(params[key]['final_matrix_bias'], dtype =self.dtype),requires_grad=False)
             
         return self.children()
                           
     def forward(self, x, is_training: bool):
-
         dropout_rate = self.dropout if is_training else 0.0
         z = self.linear_layer_1(x) # [n,d,2] --> [n, d, dim]
 
@@ -179,14 +180,20 @@ class BaseModel(nn.Module):
             layer_norm_idx += 3
 
             z_attn = self.attentions[i](q_in, k_in, v_in) # [n, d, dim]
-            z = z + F.dropout(z_attn, dropout_rate) # [n, d, dim]
+            if is_training:
+                z = z + F.dropout(z_attn, dropout_rate) # [n, d, dim]
+            else:
+                z = z + z_attn
 
             # ffn
             z_in = self.layer_norms[layer_norm_idx](z)# [n, d, dim]
             layer_norm_idx += 1
             z_ffn_1 = nn.ReLU()(self.linear_layers_1[i](z_in))
             z_ffn = self.linear_layers_2[i](z_ffn_1)
-            z = z + F.dropout(z_ffn, dropout_rate)
+            if is_training:
+                z = z + F.dropout(z_ffn, dropout_rate)
+            else:
+                z = z + z_ffn
 
             # flip N and d axes
             z = torch.swapaxes(z, -3, -2)
@@ -199,16 +206,16 @@ class BaseModel(nn.Module):
 
         # u, v dibs embeddings for edge probabilities
         u_norm =  self.layer_norm_u(z)# [n, d, dim]
-        u = self.linear_u(u_norm)
+        u_edge = self.linear_u(u_norm)
         
         v_norm =  self.layer_norm_v(z)# [n, d, dim]
-        v = self.linear_v(v_norm)
-       
+        v_edge = self.linear_v(v_norm)
+
         # edge logits
         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
-        u /= torch.linalg.norm(u, dim=-1, ord=2, keepdim=True)
-        v /= torch.linalg.norm(v, dim=-1, ord=2, keepdim=True)
-        logit_ij = torch.einsum("...id,...jd->...ij", u, v)
+        u_edge /= torch.linalg.norm(u_edge, dim=-1, ord=2, keepdim=True)
+        v_edge /= torch.linalg.norm(v_edge, dim=-1, ord=2, keepdim=True)
+        logit_ij = torch.einsum("...id,...jd->...ij", u_edge, v_edge)
         temp = self.temp.squeeze()
         logit_ij *= torch.exp(temp)
         logit_ij_bias = self.logit_ij_bias.squeeze()
@@ -245,6 +252,9 @@ class InferenceModel(nn.Module):
             # print(f"Ignoring deprecated kwarg `{k}` loaded from `model_kwargs` in checkpoint")
         # init forward pass transform
         self.net = model_class(**model_kwargs)
+        if params:
+            child = self.net.set_params(params)
+            self.net.children = child
         
     def forward(self, *args):
         # Pass the input arguments to the model and return the result.
@@ -286,10 +296,8 @@ class InferenceModel(nn.Module):
             logprobs of graph adjacency matrix prediction of shape [..., d, d]
         """
         # [..., d, d]
-        child = self.net.set_params(params)
-        self.net.children = child
+       
         logits = self.net(x, is_training)
-        import pdb; pdb.set_trace()
         logp_edges = self.sigmoid(logits)
 
         if self.mask_diag:
