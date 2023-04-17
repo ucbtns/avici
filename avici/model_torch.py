@@ -369,28 +369,24 @@ class InferenceModel(nn.Module):
     def loss(self, params, dual, key, data, t, is_training: bool):
         # `data` leaves have leading dimension [1, batch_size_device, ...]
 
-        key, subk = torch.split(key, 1)
-        if is_training:
-            x = get_train_x(subk, data, p_obs_only=self._train_p_obs_only)
-        else:
-            x = get_x(data)
+        if is_training: x = torch_get_train_x(data, p_obs_only=self._train_p_obs_only)
+        else: x = torch_get_x(data)
 
         n_vars = data["g"].shape[-1]
 
         ### inference model q(G | D)
         # [..., n_observations, d, 2] --> [..., d, d]
-        key, subk = torch.split(key, 1)
-        logits = self.net(params, subk, x, is_training)
+        self.net.children = self.net.set_params(params)
+        logits = self.net(x, is_training)
 
         # get logits [..., d, d]
-        logp1 = torch.nn.LogSigmoid(  logits)
-        logp0 = torch.nn.LogSigmoid(- logits)
+        logp1 = self.sigmoid(  logits)
+        logp0 = self.sigmoid(- logits)
 
         # labels [..., d, d]
         y_soft = data["g"]
 
         # mean over edges and skip diagonal (no self-loops)
-        # [...]
         loss_eltwise = - (y_soft * logp1 + (1 - y_soft) * logp0)
         if self.mask_diag:
             batch_loss = set_diagonal(loss_eltwise, 0.0).sum((-1, -2)) / (n_vars * (n_vars - 1))
@@ -401,13 +397,11 @@ class InferenceModel(nn.Module):
         loss_raw = batch_loss.mean() # mean over all available batch dims
 
         ### acyclicity
-        key, subk = torch.split(key, 1)
+        key, subk = random.split(key)
         if self._acyclicity_weight is not None:
             # [..., d, d]
-            if self.mask_diag:
-                logp_edges = set_diagonal(logp1, float('-inf'))
-            else:
-                logp_edges = logp1
+            if self.mask_diag: logp_edges = set_diagonal(logp1, float('-inf'))
+            else: logp_edges = logp1
 
             # [...]
             spectral_radii = self.acyclicity_spectral_log(logp_edges, subk, power_iterations=self._acyclicity_power_iters)
@@ -430,97 +424,3 @@ class InferenceModel(nn.Module):
             "mean_z_norm": torch.abs(logits).mean(),
         }
         return loss, aux
-
-
-
-# class BaseModel_FF(nn.Module):
-
-#     def __init__(self,
-#                  layers=8,
-#                  dim=128,
-#                  key_size=32,
-#                  num_heads=8,
-#                  widening_factor=4,
-#                  dropout=0.1,
-#                  out_dim=None,
-#                  logit_bias_init=-3.0,
-#                  cosine_temp_init=0.0,
-#                  ln_axis=-1,
-#                  name="BaseModel",
-#                  ):
-        
-#         super(BaseModel, self).__init__()
-#         self.dim = dim
-#         self.out_dim = out_dim or dim
-#         self.layers = 2 * layers
-#         self.dropout = dropout
-#         self.ln_axis = ln_axis
-#         self.widening_factor = widening_factor
-#         self.num_heads = num_heads
-#         self.key_size = key_size
-#         self.logit_bias_init = logit_bias_init
-#         self.cosine_temp_init = cosine_temp_init
-#         self.w_init = functools.partial(init.kaiming_uniform_, a=2.0, mode='fan_in', nonlinearity='relu')
-
-#     def forward(self, x, is_training: bool):
-
-#         dropout_rate = self.dropout if is_training else 0.0
-#         z = nn.Linear(2, self.dim)(x) # [n,d,2] --> [n, d, dim]
-
-#         for _ in range(self.layers):
-#             # mha
-#             q_in = layer_norm(self.dim)(z) # query --> [n, d, dim]
-#             k_in = layer_norm(self.dim)(z) # key --> [n, d, dim]
-#             v_in = layer_norm(self.dim)(z) # value --> [n, d, dim]
-#             z_attn = MultiHeadAttention(num_heads=self.num_heads,key_size=self.key_size, w_init_scale=2.0,model_size=self.dim,)(q_in, k_in, v_in) # [n, d, dim]
-#             z = z + F.dropout(z_attn, dropout_rate) # [n, d, dim]
-
-#             # ffn
-#             z_in = layer_norm(self.dim)(z)# [n, d, dim]
-#             z_ffn_layer_1  = nn.Linear(self.dim, self.widening_factor * self.dim)
-#             self.w_init(z_ffn_layer_1.weight)
-#             z_ffn_1 = nn.ReLU()(z_ffn_layer_1(z_in))
-
-#             z_ffn_layer_2 = nn.Linear(self.widening_factor * self.dim, self.dim)
-#             self.w_init(z_ffn_layer_2.weight)
-#             z_ffn = z_ffn_layer_2(z_ffn_1)
-#             z = z + F.dropout(z_ffn, dropout_rate)
-
-#             # flip N and d axes
-#             z = torch.swapaxes(z, -3, -2)
-
-#         z = layer_norm(self.dim)(z)
-#         assert z.shape[-2] == x.shape[-2] and z.shape[-3] == x.shape[-3], "Do we have an odd number of layers?"
-
-#         # [..., n_vars, dim]
-#         z,_ = torch.max(z, dim=-3)
-
-#         # u, v dibs embeddings for edge probabilities
-#          # This doesn;t have the right initialisation and dimensions will cause an issue
-#         u_norm = layer_norm(self.dim)(z)# [n, d, dim]
-#         u_norm_layer = nn.Linear(self.dim, self.dim)
-#         self.w_init(u_norm_layer.weight)
-#         u = u_norm_layer(u_norm)
-        
-#         v_norm = layer_norm(self.dim)(z)# [n, d, dim]
-#         v_norm_layer = nn.Linear(self.dim, self.dim)
-#         self.w_init(v_norm_layer.weight)
-#         v = v_norm_layer(u_norm)
-       
-#         # edge logits
-#         # [..., n_vars, dim], [..., n_vars, dim] -> [..., n_vars, n_vars]
-#         u /= torch.linalg.norm(u, dim=-1, ord=2, keepdim=True)
-#         v /= torch.linalg.norm(v, dim=-1, ord=2, keepdim=True)
-#         logit_ij = torch.einsum("...id,...jd->...ij", u, v)
-#         temp = torch.nn.Parameter(torch.zeros(1, 1, 1), requires_grad=True)
-#         init.constant_(temp, self.cosine_temp_init)
-#         temp = temp.squeeze()
-#         logit_ij *= torch.exp(temp)
-#         logit_ij_bias = nn.Parameter(torch.Tensor([1]))
-#         init.constant_(logit_ij_bias, self.logit_bias_init)
-#         logit_ij_bias = logit_ij_bias.squeeze()
-#         logit_ij += logit_ij_bias
-
-#         assert logit_ij.shape[-1] == x.shape[-2] and logit_ij.shape[-2] == x.shape[-2]
-#         return logit_ij
-    

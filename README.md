@@ -1,7 +1,6 @@
 # Amortized Inference for Causal Structure Learning
 
-This is the code repository for the paper 
-_Amortized Inference for Causal Structure Learning_
+This is the forked code repository for the paper _Amortized Inference for Causal Structure Learning_
 ([Lorch et al., 2022](https://arxiv.org/abs/2205.12934), NeurIPS 2022).
 Performing **a**mortized **v**ariational **i**nference for 
 **c**ausal d**i**scovery (AVICI) allows inferring causal structure 

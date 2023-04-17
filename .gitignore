@@ -1,6 +1,11 @@
 tmp/
 cache/
 model_data/ 
+wandb/
+/test_torch.py
+/tests.py
+/baseline_run.py
+
 
 # git cannot parse exceptions if not adding the * to data/*
 .DS_Store

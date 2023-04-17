@@ -1,7 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import wandb
 
-def visualize(mat, true=None, size=0.75):
+def visualize(mat, true=None, size=0.75, wdb=False, name=''):
     size = np.sqrt(mat.shape[-1]) * size
     plt.rcParams['figure.figsize'] = [size if true is None else 2 * size, size]
     if true is None:
@@ -19,6 +20,8 @@ def visualize(mat, true=None, size=0.75):
         ax.set_title(label, pad=10)
 
     plt.tight_layout()
-    plt.show()
-    return
+    if wdb:
+        wandb.log({name: plt})
+    plt.close()
+    return 
 
